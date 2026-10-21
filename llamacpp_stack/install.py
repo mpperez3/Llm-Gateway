@@ -185,6 +185,7 @@ def _default_global_replicas_config() -> dict[str, object]:
         "max": "auto",
         "placement": "exclusive_gpus",
         "safety_vram_mib": 2048,
+        "gpu_capacity_mib": 24576,
         "prefer_base_over_replica": False,
         "idle_grace_s": 600,
         "max_idle_s": 1800,
@@ -489,6 +490,13 @@ def _default_experimental_config() -> dict[str, object]:
             "max_chars": 20000,
             "include_reasoning": False,
             "include_tool_calls": True,
+        },
+        "tool_intent_capture": {
+            "enabled": False,
+            "mode": "trigger",
+            "path": "",
+            "max_entries": 20,
+            "max_chars": 8000000,
         }
     }
 
@@ -573,6 +581,20 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                 response_log["include_reasoning"] = _as_bool(response_log.get("include_reasoning"), False)
                 response_log["include_tool_calls"] = _as_bool(response_log.get("include_tool_calls", True))
                 cfg["chat_last_response_log"] = response_log
+            elif key == "tool_intent_capture" and isinstance(value, dict):
+                capture = dict(cfg["tool_intent_capture"])
+                capture.update(value)
+                capture["enabled"] = _as_bool(capture.get("enabled"), False)
+                capture["mode"] = str(capture.get("mode") or "trigger").strip().lower()
+                if capture["mode"] not in {"trigger", "all"}:
+                    capture["mode"] = "trigger"
+                capture["path"] = str(capture.get("path") or "").strip()
+                for ck, dv in (("max_entries", 20), ("max_chars", 8000000)):
+                    try:
+                        capture[ck] = max(0, int(capture.get(ck, dv)))
+                    except Exception:
+                        capture[ck] = dv
+                cfg["tool_intent_capture"] = capture
             elif key == "model_probe_autoload" and isinstance(value, dict):
                 normalized, _ = _normalize_model_probe_autoload_config(value)
                 cfg["model_probe_autoload"] = normalized
@@ -1713,6 +1735,73 @@ def locate_cuda_root_for_python(python_exec: str) -> Path | None:
     if (candidate_root / "include").exists() and any((candidate_root / "lib64").glob("libcudart.so*")):
         return candidate_root
     return None
+
+
+def cuda_nvcc_release(nvcc: Path | str) -> tuple[int, int] | None:
+    """``(major, minor)`` reported by ``nvcc --version``, or None if unreadable."""
+    try:
+        proc = subprocess.run(
+            [str(nvcc), "--version"], capture_output=True, text=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"release (\d+)\.(\d+)", proc.stdout)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def cuda_header_release(cuda_root: Path) -> tuple[int, int] | None:
+    """``(major, minor)`` from the toolkit's own ``include/cuda.h``."""
+    try:
+        text = (cuda_root / "include" / "cuda.h").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    match = re.search(r"^#define CUDA_VERSION (\d+)$", text, re.MULTILINE)
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value // 1000, (value % 1000) // 10
+
+
+CMAKE_MIN_FOR_CUDA13 = (3, 30)
+
+
+def cmake_version(binary: str) -> tuple[int, int] | None:
+    try:
+        proc = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"cmake version (\d+)\.(\d+)", proc.stdout)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def select_cmake(cuda_compiler: Path | str | None) -> str:
+    """The CMake to configure with, new enough for the detected CUDA compiler.
+
+    CMake below 3.30 identifies a CUDA 13 compiler by compiling an ``sm_52`` probe,
+    an architecture CUDA 13 removed, so configure dies before any project code runs.
+    A newer CMake next to the interpreter (``uv tool install cmake``) is preferred
+    over a too-old one on PATH.
+    """
+    required = CMAKE_MIN_FOR_CUDA13 if cuda_compiler else (0, 0)
+    found = cuda_nvcc_release(cuda_compiler) if cuda_compiler else None
+    if not found or found[0] < 13:
+        required = (0, 0)
+    candidates = [shutil.which("cmake") or "cmake", str(Path.home() / ".local" / "bin" / "cmake")]
+    for candidate in candidates:
+        version = cmake_version(candidate)
+        if version and version >= required:
+            return candidate
+    raise RuntimeError(
+        f"cmake >= {required[0]}.{required[1]} is required to build llama.cpp with CUDA "
+        f"{found[0]}.x (the older compiler-identification probe uses sm_52, which CUDA 13 "
+        f"removed). Install a newer one with: uv tool install cmake"
+    )
 
 
 def locate_nccl_root_for_python(python_exec: str) -> Path | None:
@@ -4434,6 +4523,39 @@ def render_vllm_server_wrapper(layout: InstallLayout) -> str:
     )
 
 
+def render_cli_wrapper(layout: InstallLayout) -> str:
+    env_file = layout.config_dir / ENV_BASENAME
+    return textwrap.dedent(
+        f"""\
+        #!/usr/bin/env bash
+        set -euo pipefail
+        set -a
+        source {env_file}
+        set +a
+        : "${{LLM_SERVER_PYTHONPATH:=${{HEIMDALL_GATEWAY_PYTHONPATH:-}}}}"
+        : "${{LLM_SERVER_CUDA_ROOT:=${{HEIMDALL_GATEWAY_CUDA_ROOT:-}}}}"
+        : "${{LLM_SERVER_NCCL_ROOT:=${{HEIMDALL_GATEWAY_NCCL_ROOT:-}}}}"
+        export PYTHONPATH="$LLM_SERVER_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
+        if [[ -n "${{LLM_SERVER_CUDA_ROOT:-}}" ]]; then
+          export CUDA_PATH="$LLM_SERVER_CUDA_ROOT"
+          export LD_LIBRARY_PATH="$LLM_SERVER_CUDA_ROOT/lib64:$LLM_SERVER_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+        fi
+        if [[ -n "${{LLM_SERVER_NCCL_ROOT:-}}" ]]; then
+          export LD_LIBRARY_PATH="$LLM_SERVER_NCCL_ROOT/lib64:$LLM_SERVER_NCCL_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+        fi
+        exec "$PYTHON_BIN" -m llamacpp_stack.llamacpp_api_install "$@"
+        """
+    )
+
+
+def write_cli_wrapper(layout: InstallLayout) -> Path:
+    layout.bin_dir.mkdir(parents=True, exist_ok=True)
+    target = layout.bin_dir / CLI_COMMAND
+    target.write_text(render_cli_wrapper(layout), encoding="utf-8")
+    target.chmod(0o755)
+    return target
+
+
 def _resolve_llama_swap_for_render() -> dict[str, object]:
     for candidate in (
         Path.home() / f".config/{PRODUCT_SLUG}/conf.json",
@@ -4872,14 +4994,29 @@ def build_llama_cpp_from_source(
     build_env = os.environ.copy()
     arch = detect_cuda_arch() if enable_cuda else None
     nvcc_path: Path | None = None
-    nvcc_path_raw = build_env.get("CUDACXX") or locate_nvcc() or locate_nvcc_for_python(python_exec)
+    rpath_dirs: list[str] = []
+    cuda_root = Path(build_env["CUDAToolkit_ROOT"]) if build_env.get("CUDAToolkit_ROOT") else locate_cuda_root_for_python(python_exec)
+    # The compiler and the toolkit must come from the same CUDA install: a
+    # venv-provided toolkit next to a system nvcc pairs CUDA 13 headers with a
+    # CUDA 12 compiler, which CCCL rejects outright. The toolkit root decides.
+    nvcc_path_raw = str(build_env.get("CUDACXX") or "")
+    if cuda_root:
+        rooted = cuda_root / "bin" / "nvcc"
+        if rooted.exists():
+            resolved_root = cuda_root.resolve()
+            inherited = Path(nvcc_path_raw).resolve() if nvcc_path_raw else None
+            if inherited is None or resolved_root not in inherited.parents:
+                nvcc_path_raw = str(rooted)
+    if not nvcc_path_raw:
+        nvcc_path_raw = (
+            (locate_nvcc_for_python(python_exec) or locate_nvcc() or "")
+            if cuda_root
+            else (locate_nvcc() or locate_nvcc_for_python(python_exec) or "")
+        )
     if enable_cuda and nvcc_path_raw:
         _export_nvcc_path(nvcc_path_raw)
         build_env = os.environ.copy()
-        nvcc_path = Path(nvcc_path_raw).resolve() if isinstance(nvcc_path_raw, str) else nvcc_path_raw
-    
-    rpath_dirs: list[str] = []
-    cuda_root = Path(build_env["CUDAToolkit_ROOT"]) if build_env.get("CUDAToolkit_ROOT") else locate_cuda_root_for_python(python_exec)
+        nvcc_path = Path(nvcc_path_raw).resolve()
     if enable_cuda and cuda_root:
         normalize_python_cuda_layout(cuda_root)
         _export_cuda_root(cuda_root)
@@ -4896,6 +5033,27 @@ def build_llama_cpp_from_source(
             if lib_dir.exists():
                 rpath_dirs.append(str(lib_dir))
     
+    if enable_cuda and cuda_root and nvcc_path:
+        header_release = cuda_header_release(cuda_root)
+        compiler_release = cuda_nvcc_release(nvcc_path)
+        if (
+            header_release
+            and compiler_release
+            and header_release[0] == compiler_release[0]
+            and header_release != compiler_release
+        ):
+            print(
+                f"[!] CUDA headers are {header_release[0]}.{header_release[1]} but "
+                f"{nvcc_path} is {compiler_release[0]}.{compiler_release[1]}; disabling "
+                "CCCL's toolkit/compiler compatibility check. Aligning the nvidia/* "
+                "packages to one version is the clean fix."
+            )
+            appended = str(build_env.get("NVCC_APPEND_FLAGS", "")).strip()
+            build_env["NVCC_APPEND_FLAGS"] = " ".join(
+                part for part in (appended, "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK") if part
+            )
+    cmake_bin = select_cmake(nvcc_path if enable_cuda else None)
+
     # Build CMake arguments from configuration file
     cmake_args = _build_cmake_args_from_config(
         src_dir=src_dir,
@@ -4909,6 +5067,7 @@ def build_llama_cpp_from_source(
         rpath_dirs=rpath_dirs if rpath_dirs else None,
     )
     
+    cmake_args[0] = cmake_bin
     build_jobs = determine_build_jobs()
     _run(cmake_args, env=build_env)
     _run(["cmake", "--build", str(build_dir), "--target", "llama-server", "-j", str(build_jobs)], env=build_env)
@@ -7003,6 +7162,11 @@ def install_stack(args: argparse.Namespace) -> int:
                         _install_optional_engines(layout, _sel, _rt, True)
             except Exception:
                 pass
+        if not args.dry_run and (
+            os.access(layout.bin_dir, os.W_OK)
+            or (not layout.bin_dir.exists() and os.access(layout.bin_dir.parent, os.W_OK))
+        ):
+            write_cli_wrapper(layout)
         # Ensure services are installed/enabled as well as restarted. A package-only
         # reinstall may run on a machine where the unit files exist under our
         # config dir but systemd currently says "Unit not loaded". enable --now
@@ -7357,28 +7521,7 @@ def install_stack(args: argparse.Namespace) -> int:
         vllm_wrapper = layout.bin_dir / "vllm-server"
         vllm_wrapper.write_text(render_vllm_server_wrapper(layout), encoding="utf-8")
         vllm_wrapper.chmod(0o755)
-        target_wrapper = layout.bin_dir / CLI_COMMAND
-        target_wrapper.write_text(
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "set -a\n"
-            f"source {layout.config_dir / ENV_BASENAME}\n"
-            "set +a\n"
-            ": \"${LLM_SERVER_PYTHONPATH:=${HEIMDALL_GATEWAY_PYTHONPATH:-}}\"\n"
-            ": \"${LLM_SERVER_CUDA_ROOT:=${HEIMDALL_GATEWAY_CUDA_ROOT:-}}\"\n"
-            ": \"${LLM_SERVER_NCCL_ROOT:=${HEIMDALL_GATEWAY_NCCL_ROOT:-}}\"\n"
-            "export PYTHONPATH=\"$LLM_SERVER_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}\"\n"
-            "if [[ -n \"${LLM_SERVER_CUDA_ROOT:-}\" ]]; then\n"
-            "  export CUDA_PATH=\"$LLM_SERVER_CUDA_ROOT\"\n"
-            "  export LD_LIBRARY_PATH=\"$LLM_SERVER_CUDA_ROOT/lib64:$LLM_SERVER_CUDA_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n"
-            "fi\n"
-            "if [[ -n \"${LLM_SERVER_NCCL_ROOT:-}\" ]]; then\n"
-            "  export LD_LIBRARY_PATH=\"$LLM_SERVER_NCCL_ROOT/lib64:$LLM_SERVER_NCCL_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n"
-            "fi\n"
-            "exec \"$PYTHON_BIN\" -m llamacpp_stack.llamacpp_api_install \"$@\"\n",
-            encoding="utf-8",
-        )
-        target_wrapper.chmod(0o755)
+        write_cli_wrapper(layout)
         ensure_service_writable_dirs(layout, args.dry_run)
 
     write_manifest(layout, target_llama_cpp_tag, target_llamaswap_tag, strategy, backend, args.dry_run)

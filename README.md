@@ -382,9 +382,23 @@ choice for large models:
 
 | key | default | effect |
 | --- | --- | --- |
-| `prefer_base_over_replica` | `false` | Serve a fresh, unaffinitised request from the base even when a replica is more idle, so replicas are only used for real concurrency. |
-| `idle_grace_s` | `600` | A replica may only be created once the base has been idle this long, so a burst of traffic does not leave a replica behind. A base that has never run is exempt. |
+| `prefer_base_over_replica` | `false` | With `true`, a fresh, unaffinitised request goes to the base even when a warm replica is more idle, and no replica is cold-created. With `false`, a warm idle replica may take the request. |
+| `idle_grace_s` | `600` | Deprecated, kept so existing configs still parse. Request-path cold scale-out is now driven by concurrency (a busy base), not by how long the base has been idle. Use `experimental.idle_gpu_warmer` to keep a spare card warm proactively. |
 | `max_idle_s` | `1800` | A replica with zero in-flight requests retires itself after this, freeing its GPU. |
+
+Cold replica creation is a concurrency decision: it only happens while the base
+already has a request in flight (or, with `prefer_base_over_replica: false`, when
+no warm replica can take the request). An idle base always serves the next
+request — resident or not — so a replica the reaper retired after `max_idle_s` is
+not immediately reloaded on the next conversation. Warm replicas are still
+reused, and `experimental.idle_gpu_warmer` can pre-warm spare cards asynchronously.
+
+When a conversation is already bound to the base and the base stays busy for
+`experimental.affinity_spillover.idle_threshold_s` (30 s by default), it may move
+to a **ready, idle replica**. The move is one-directional (base → warm replica),
+never targets a cold route, never moves a replica back to the base on saturation,
+and still passes the affinity transfer budget (`min_dwell_s`, `max_transfers`,
+`evacuate_cooldown_s`).
 
 Absent keys are filled in on the next `llm-server config-migrate`, and existing
 values are never overwritten.
@@ -474,6 +488,62 @@ $ systemctl --user restart llm-server-manager llm-server-router
 $ llm-server config-keys --format json | jq '.experimental.dedup_inflight'
 ```
 
+### Idle-GPU warmer (experimental)
+
+The warmer is **off by default**. When it is on, the manager daemon keeps a GPU that has
+been idle for a while warm by loading an already-published route onto it, so the next
+request for that model finds a resident process instead of a cold load.
+
+```json
+{
+  "experimental": {
+    "idle_gpu_warmer": {
+      "enabled": true,
+      "poll_s": 30,
+      "idle_after_s": 300,
+      "cooldown_s": 900,
+      "warm_timeout_s": 300
+    }
+  }
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch. Off means the loop costs one config read per tick. |
+| `poll_s` | `30` | How often the daemon re-reads the config and re-evaluates the fleet. The switch is read every tick, so enabling or disabling it needs no restart. |
+| `idle_after_s` | `300` | How long a card must have had **no** `llama-server` process on it before it is a candidate. |
+| `cooldown_s` | `900` | After a card is judged unable to fit any published route, how long it stays quiet before being measured again. |
+| `warm_timeout_s` | `300` | Read timeout for the warm-up request. |
+
+Every tick the daemon reads `nvidia-smi`, `llama-swap`'s `/v1/models` and the server
+process list, then picks the card that has been empty longest and loads **the
+cheapest-to-start published route that lives on it**: first a model whose weights are
+already resident somewhere (its bytes are in the page cache, so the load is a re-map),
+otherwise the smallest route that fits the free VRAM. Nothing in this rule looks at which
+model it is.
+
+The load is a minimal generation request (`max_tokens: 1`, a one-character prompt, no
+stream) aimed at that route id. llama-swap performs the load, on the card the route's own
+command names. **The warmer never writes `config.yaml`** — a write there makes llama-swap
+unload every model and destroy every KV cache, which is the opposite of keeping a card
+warm. The same is true of turning the feature on: no `update`, no re-render, no restart.
+
+It skips a card, and says so in the request log, when the target route is already loaded,
+when the target model has a request in flight, when nothing published fits the free VRAM
+(after which the card cools down instead of re-measuring every tick), or when a warm-up
+for that card or that route is already in flight. At most one warm-up runs per tick, so a
+fleet of idle cards loads one model at a time instead of all at once.
+
+Request-log events: `idle_warmer_warmed` (with `route`, `gpu`, `reason` of
+`weights_resident` or `smallest_fitting`), `idle_warmer_refused` (`reason` of
+`already_loaded`, `model_in_flight`, `insufficient_vram`, `warm_in_flight`),
+`idle_warmer_failed`, `idle_warmer_probe_failed` and `idle_warmer_error`.
+
+```console
+$ grep idle_warmer ~/.local/state/llm-server/api-requests.log.YYYY-MM-DD | tail -20
+```
+
 ## Replicas, loading, and observability
 
 The first request that needs a cold model owns its load. Concurrent requests
@@ -505,10 +575,17 @@ ever placed on a GPU that no assigned base owns. The result also drives the
 llama-swap matrix, so two models that now sit on different cards are declared
 co-loadable and stop evicting each other.
 
-Placement is baked into `config.yaml`, so changing it takes an
-`llm-server update` plus a service restart — it cannot be changed at runtime,
-because rewriting `config.yaml` makes llama-swap tear down every loaded model
-and lose all KV caches.
+Which card a model *prefers* is baked into `config.yaml`, so publishing a new set of
+routes takes an `llm-server update` plus a service restart. Rewriting `config.yaml` at
+runtime is not an option: it makes llama-swap tear down every loaded model and lose all
+KV caches.
+
+Because of that, a **single-GPU large model also publishes one route per card**
+(`<model_id>__gpu0`, `<model_id>__gpu1`, …). Serving a model on a card other than its
+preferred one is then just a routing decision among routes that already exist, not a
+config rewrite — the gateway picks the free card at request time and the file never
+changes. See [docs/runtime-placement-policy.md](docs/runtime-placement-policy.md) for the
+full policy (idle-GPU warmer, eviction priority, and the remaining trade-offs).
 
 ### When a load is refused
 

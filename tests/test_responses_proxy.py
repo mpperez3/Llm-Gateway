@@ -59,6 +59,31 @@ def test_chat_last_response_log_config_normalizes_defaults_and_overrides():
     assert cfg["include_tool_calls"] is False
 
 
+def test_tool_intent_capture_config_normalizes_defaults_and_overrides():
+    normalized = _normalize_experimental_config({
+        "tool_intent_capture": {
+            "enabled": True,
+            "path": " /tmp/caps ",
+            "max_entries": "7",
+            "max_chars": "999",
+        }
+    })
+
+    cfg = normalized["tool_intent_capture"]
+    assert cfg["enabled"] is True
+    assert cfg["path"] == "/tmp/caps"
+    assert cfg["max_entries"] == 7
+    assert cfg["max_chars"] == 999
+
+
+def test_tool_intent_capture_defaults_disabled():
+    cfg = _normalize_experimental_config({})["tool_intent_capture"]
+    assert cfg["enabled"] is False
+    assert cfg["mode"] == "trigger"
+    assert cfg["max_entries"] == 20
+    assert cfg["max_chars"] == 8000000
+
+
 def test_responses_chat_translation_enables_llama_prompt_cache_by_default():
     assert _responses_payload_to_chat_payload({"input": "hello"}, "m")["cache_prompt"] is True
     assert _responses_payload_to_chat_payload({"input": "hello", "cache_prompt": False}, "m")["cache_prompt"] is False
@@ -2511,7 +2536,7 @@ def test_live_mmproj_runtime_detects_stale_loaded_process_without_mmproj(tmp_pat
     monkeypatch.setattr(
         cli,
         "get_catalog_model_process",
-        lambda model_id, catalog: {
+        lambda model_id, catalog, **kwargs: {
             "pid": 123,
             "cmdline": f"/opt/llama-server --port 18080 --model {model_path}",
             "model_path": str(model_path),
@@ -2539,7 +2564,7 @@ def test_live_mmproj_runtime_accepts_matching_loaded_process(tmp_path, monkeypat
     monkeypatch.setattr(
         cli,
         "get_catalog_model_process",
-        lambda model_id, catalog: {
+        lambda model_id, catalog, **kwargs: {
             "pid": 123,
             "cmdline": f"/opt/llama-server --port 18080 --model {model_path} --mmproj {mmproj_path}",
             "model_path": str(model_path),

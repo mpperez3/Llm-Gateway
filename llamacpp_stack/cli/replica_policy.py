@@ -139,9 +139,11 @@ class TransferReason(str, enum.Enum):
 
     Every write to the affinity map must name one of these.  The enum is the
     guardrail that keeps a future routing branch from silently moving a
-    conversation: there is deliberately no ``busy``/``saturation``/
-    ``spillover`` member, so "move because the target is busy" is not
-    expressible, and a test asserts the absence of those names.
+    conversation.  There is deliberately no generic ``busy``/``load_balance``/
+    ``rebalance`` member.  The single saturation-related member is scoped by
+    the router to one direction -- a base-owned conversation may move to a
+    **ready idle replica** after the spillover threshold; a replica is never
+    moved to the base, and no cold target is ever selected.
     """
 
     #: No previous binding (new conversation) or binding expired.
@@ -154,6 +156,9 @@ class TransferReason(str, enum.Enum):
     EVACUATE_TARGET_DEAD = "evacuate_target_dead"
     #: No route remains that can serve the request at all.
     EVACUATE_NO_ROUTE = "evacuate_no_route"
+    #: A base-owned conversation waited on a saturated base while a ready idle
+    #: replica could serve it.  Router-only: the target must already be warm.
+    EVACUATE_BASE_SATURATED = "evacuate_base_saturated"
     #: Affinity disabled or unusable; serve without binding.
     DEGRADED_UNBOUND = "degraded_unbound"
 
@@ -163,6 +168,7 @@ TRANSFER_REASONS = frozenset(
     {
         TransferReason.EVACUATE_TARGET_DEAD,
         TransferReason.EVACUATE_NO_ROUTE,
+        TransferReason.EVACUATE_BASE_SATURATED,
     }
 )
 

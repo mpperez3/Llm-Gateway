@@ -240,6 +240,7 @@ def test_legacy_heimdall_requests_log_env_fallback(tmp_path, monkeypatch):
 
     legacy = tmp_path / "legacy-viewer.log"
     legacy_key = "HEIMDALL_GATEWAY_REQUESTS_LOG"
+    monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG", raising=False)
     monkeypatch.setenv(legacy_key, str(legacy))
     candidates = _candidate_request_log_paths(None)
     assert any(str(c).startswith(str(legacy)) for c in candidates) or legacy in candidates

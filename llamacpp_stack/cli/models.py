@@ -11,6 +11,8 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import cast
 
 from .constants import (
     DEFAULT_CTX_SIZE,
@@ -151,6 +153,12 @@ class ReplicaConfig:
     gpus_per_replica: int = 1
     placement: str = "exclusive_gpus"
     safety_vram_mib: int = 2048
+    #: Capacity of one card, read from ``replicas.gpu_capacity_mib``. A configured
+    #: figure rather than a probe, because the replica routes built from it are
+    #: written into config.yaml and a live reading there would make two renders of
+    #: one catalog disagree. 24576 MiB is a 24 GiB card: the common modern size, and
+    #: an under-statement on anything larger, which only costs a replica.
+    gpu_capacity_mib: int = 24576
     max_models_per_gpu: int = 2
     max_pack_fraction: float = 0.35
     sticky_ttl_s: int = 3600
@@ -161,9 +169,10 @@ class ReplicaConfig:
     #: on makes the redirect permanent, which costs genuine request parallelism
     #: whenever a base and a replica could both have served a conversation.
     prefer_base_over_replica: bool = False
-    #: Policy knob. How long the base must have been idle before a replica may be
-    #: spread to or created. ``0`` disables the gate. Raising it keeps a warm base
-    #: warm; lowering it trades a cold load for parallelism sooner.
+    #: Deprecated. Kept so existing configs still parse. Request-path cold
+    #: scale-out is now gated by real concurrency (a busy base), so a resident
+    #: idle base always serves; use ``experimental.idle_gpu_warmer`` to keep a
+    #: spare card warm proactively.
     idle_grace_s: int = 600
     #: Policy knob, reaper backstop. Retire a replica idle at least this long even
     #: when nothing else wants its GPU, so VRAM is handed back without waiting for
@@ -200,6 +209,54 @@ class ProbeTraceMetrics:
     oom_requested_mib: float | None = None
 
 
+def model_weights_size_mib(model: ManagedModel) -> float | None:
+    """Bytes ``model.local_path`` occupies on disk, as a whole tree or one file.
+
+    ``None`` when the path cannot be measured at all; a caller that treats an
+    unknown size as zero has to say so itself, because the two answers mean
+    different things to a capacity check.
+    """
+    try:
+        path = Path(model.local_path)
+        if path.is_dir():
+            total = sum(
+                file_path.stat().st_size
+                for file_path in path.rglob("*")
+                if file_path.is_file()
+            )
+        else:
+            total = path.stat().st_size
+    except Exception:
+        return None
+    return total / (1024 * 1024)
+
+
+def estimate_model_runtime_mib(model: ManagedModel) -> float | None:
+    """Whole-process footprint of one loaded copy: weights, KV cache, buffers, overhead.
+
+    This is the only figure that answers "will this fit", so every capacity decision
+    compares against it; raw weights alone understate a process by the KV cache and
+    compute buffers it needs. ``None`` when the weights cannot be measured, and an
+    unmeasured model must never be admitted: an unknown cost is not a small cost.
+
+    A pure function of the catalog - only ``local_path``, ``ctx_size`` and
+    ``server_overrides`` - so two renders of one catalog agree.
+    """
+    size_mib = model_weights_size_mib(model)
+    if size_mib is None:
+        return None
+    overrides = model.server_overrides or {}
+    # server_overrides is dict[str, object]; the int() is kept so a string-valued
+    # override such as "32768" still converts, and cast so the arithmetic below is typed.
+    ctx = int(cast("int", overrides.get("ctx_size", model.ctx_size)) or model.ctx_size or 8192)
+    parallel = int(cast("int", overrides.get("parallel", 1)) or 1)
+    batch = int(cast("int", overrides.get("batch_size", 2048)) or 2048)
+    ubatch = int(cast("int", overrides.get("ubatch_size", 512)) or 512)
+    kv_mib = (ctx * parallel * (size_mib / 2048.0) * 0.5) / 1024.0
+    compute_mib = (ubatch * 0.5) + (batch * 0.1)
+    return (size_mib * 1.08) + kv_mib + compute_mib + 700.0
+
+
 __all__ = [
     "Spinner",
     "LoadingBar",
@@ -207,4 +264,6 @@ __all__ = [
     "ReplicaConfig",
     "ReplicaRecord",
     "ProbeTraceMetrics",
+    "model_weights_size_mib",
+    "estimate_model_runtime_mib",
 ]

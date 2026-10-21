@@ -125,21 +125,27 @@ class TestFaultClassification(unittest.TestCase):
 
 
 class TestTransferReasonVocabulary(unittest.TestCase):
-    """The enum is the enforcement mechanism: saturation must be inexpressible."""
+    """The enum is the enforcement mechanism: only the scoped spillover exists."""
 
-    def test_no_saturation_or_spillover_reasons_exist(self) -> None:
+    def test_saturation_is_only_the_scoped_base_spillover_reason(self) -> None:
         names = {member.name.lower() for member in TransferReason}
         names |= {member.value.lower() for member in TransferReason}
-        for banned in ("busy", "saturated", "saturation", "spillover", "load_balance", "rebalance"):
+        saturation = {name for name in names if "saturat" in name}
+        self.assertEqual(saturation, {"evacuate_base_saturated"})
+        for banned in ("busy", "spillover", "load_balance", "rebalance"):
             self.assertFalse(
                 any(banned in name for name in names),
-                f"TransferReason must not encode '{banned}': saturation is never a reason to move a conversation",
+                f"TransferReason must not encode '{banned}'",
             )
 
-    def test_only_hard_reasons_count_as_transfers(self) -> None:
+    def test_transfer_reasons_are_the_declared_set(self) -> None:
         self.assertEqual(
             set(TRANSFER_REASONS),
-            {TransferReason.EVACUATE_TARGET_DEAD, TransferReason.EVACUATE_NO_ROUTE},
+            {
+                TransferReason.EVACUATE_TARGET_DEAD,
+                TransferReason.EVACUATE_NO_ROUTE,
+                TransferReason.EVACUATE_BASE_SATURATED,
+            },
         )
 
 
@@ -385,6 +391,81 @@ class PolicyOwnershipTest(unittest.TestCase):
         self.assertIsNone(dead_again.target, "must serve unbound rather than pin to a dead target")
         self.assertIs(dead_again.decision, AffinityDecision.UNBOUND)
         self.assertIsNone(self.state.owner_of(self.key, now=1000.0))
+
+
+class AffinityGenerationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.state = cli.ReplicaRouterState()
+        self.cfg = normalize_affinity_config(None)
+        self.key = "qwen3.8-27b-EXL3:fallback:abc:def"
+        self.base = "qwen3.8-27b-EXL3"
+        self.replica = "qwen3.8-27b-EXL3__replica_0"
+
+    def _bind(self, target: str, now: float = 1000.0):
+        return self.state.bind(
+            self.key, target, TransferReason.INITIAL_BIND, ttl_s=3600.0, cfg=self.cfg, now=now
+        )
+
+    def test_a_reloaded_base_invalidates_the_binding(self) -> None:
+        self.state.base_pid[self.base] = 111
+        self._bind(self.base)
+        self.assertFalse(self.state.affinity_owner_is_stale(self.key, self.base))
+        self.state.base_pid[self.base] = 222
+        self.assertTrue(self.state.affinity_owner_is_stale(self.key, self.base))
+
+    def test_a_reloaded_replica_invalidates_the_binding(self) -> None:
+        self.state.records[self.replica] = ReplicaRecord(
+            base_model_id=self.base, replica_model_id=self.replica, pid=111
+        )
+        self._bind(self.replica)
+        self.assertFalse(self.state.affinity_owner_is_stale(self.key, self.replica))
+        self.state.records[self.replica].pid = 222
+        self.assertTrue(self.state.affinity_owner_is_stale(self.key, self.replica))
+
+    def test_an_unchanged_process_keeps_the_binding(self) -> None:
+        self.state.base_pid[self.base] = 111
+        self._bind(self.base)
+        self.assertFalse(self.state.affinity_owner_is_stale(self.key, self.base))
+
+    def test_unknown_pid_never_invalidates(self) -> None:
+        self._bind(self.base)
+        self.state.base_pid[self.base] = 222
+        self.assertFalse(
+            self.state.affinity_owner_is_stale(self.key, self.base),
+            "absence of a pid is not evidence that the process changed",
+        )
+
+    def test_forget_affinity_removes_the_generation(self) -> None:
+        self.state.base_pid[self.base] = 111
+        self._bind(self.base)
+        self.state.forget_affinity(self.key)
+        self.assertIsNone(self.state.owner_of(self.key, now=1000.0))
+        self.assertNotIn(self.key, self.state.affinity_owner_pid)
+
+    def test_prune_drops_the_generation_with_an_expired_binding(self) -> None:
+        self.state.base_pid[self.base] = 111
+        self._bind(self.base, now=1000.0)
+        self.state.prune(now=5000.0)
+        self.assertNotIn(self.key, self.state.affinity)
+        self.assertNotIn(self.key, self.state.affinity_owner_pid)
+
+    def test_a_transfer_records_the_new_process_generation(self) -> None:
+        self.state.base_pid[self.base] = 111
+        self.state.records[self.replica] = ReplicaRecord(
+            base_model_id=self.base, replica_model_id=self.replica, pid=222
+        )
+        self._bind(self.base)
+        result = self.state.bind(
+            self.key,
+            self.replica,
+            TransferReason.EVACUATE_NO_ROUTE,
+            ttl_s=3600.0,
+            cfg=self.cfg,
+            now=2000.0,
+        )
+        self.assertEqual(result.target, self.replica)
+        self.assertEqual(self.state.affinity_owner_pid[self.key], 222)
+        self.assertFalse(self.state.affinity_owner_is_stale(self.key, self.replica))
 
 
 class ProbeTest(unittest.TestCase):

@@ -162,6 +162,7 @@ from llamacpp_stack.install import (
     _render_env,
     render_llamaswap_wrapper,
     render_vllm_server_wrapper,
+    write_cli_wrapper,
     restart_systemd_units,
     stop_systemd_units,
     wait_for_manager_socket,
@@ -1448,6 +1449,16 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertIn('export PATH="$(dirname "$PYTHON_BIN"):', wrapper)
             self.assertIn("--n-gpu-layers", wrapper)
 
+    def test_write_cli_wrapper_is_executable_and_targets_the_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = write_cli_wrapper(Namespace(bin_dir=root / "bin", config_dir=root / "config"))
+            self.assertTrue(target.is_file())
+            self.assertTrue(os.access(target, os.X_OK))
+            text = target.read_text(encoding="utf-8")
+            self.assertIn("llamacpp_stack.llamacpp_api_install", text)
+            self.assertIn(str(root / "config"), text)
+
     def test_vllm_model_command_keeps_special_options_and_public_model_id(self) -> None:
         model = ManagedModel(
             model_id="unsloth-qwen3.6-27b-nvfp4",
@@ -2405,10 +2416,14 @@ class InstallHelpersTest(unittest.TestCase):
 
     def test_update_models_dispatches_each_reference(self) -> None:
         args = Namespace(repo=["org/a:Q4", "org/b:Q5"], hf=None, model_id=None, file=None)
-        with mock.patch("llamacpp_stack.cli.update_config", side_effect=["updated", "updated"]) as update_mock:
+        with (
+            mock.patch("llamacpp_stack.cli.update_config", side_effect=["updated", "updated"]) as update_mock,
+            mock.patch("llamacpp_stack._cli_impl.restart_service_to_free_vram") as restart_mock,
+        ):
             result = update_models(args)
         self.assertEqual(result, 0)
         self.assertEqual([call.args[0].repo for call in update_mock.call_args_list], ["org/a:Q4", "org/b:Q5"])
+        restart_mock.assert_called_once_with("llm-server-router.service")
 
     def test_cli_main_shows_subcommand_help_on_unrecognized_argument(self) -> None:
         stderr = io.StringIO()
@@ -5223,7 +5238,7 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual([entry[0].model_id for entry in entries], ["repo-q4", "repo-q4__replica_0"])
             self.assertEqual(entries[1][2], [3, 4, 5])
 
-    def test_render_config_uses_global_replica_defaults_does_not_precreate_replicas(self) -> None:
+    def test_render_config_publishes_replicas_from_the_global_replica_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             model_path = root / "model.gguf"
@@ -5246,23 +5261,33 @@ class InstallHelpersTest(unittest.TestCase):
                     idle_ttl=10,
                     replica_defaults={"enabled": True, "max": "auto", "placement": "exclusive_gpus"},
                 )
-            rendered = config_path.read_text(encoding="utf-8")
-            self.assertNotIn("repo-q4__replica_0", rendered)
-            self.assertNotIn("repo-q4__replica_1", rendered)
+            rendered = yaml.safe_load("\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#")))
+            self.assertIn("repo-q4__replica_0", rendered["models"])
+            self.assertNotIn("repo-q4__replica_1", rendered["models"])
+            self.assertEqual(
+                rendered["models"]["repo-q4__replica_0"]["metadata"],
+                {"internal_replica_of": "repo-q4"},
+            )
+            self.assertIn(
+                "/usr/bin/env CUDA_VISIBLE_DEVICES=3,4,5",
+                rendered["models"]["repo-q4__replica_0"]["cmd"],
+            )
 
+            # The route the render published is the route the request path would
+            # have had to bolt on, so re-asking for it must not rewrite the file.
+            before = config_path.read_bytes()
+            before_mtime = config_path.stat().st_mtime_ns
             ensure_replica_route_in_llamaswap_config(
                 model,
                 0,
-                [0, 1, 2],
+                [3, 4, 5],
                 [model],
                 config_path,
                 root / "llama-server",
                 10,
             )
-            rendered = config_path.read_text(encoding="utf-8")
-            self.assertIn("repo-q4__replica_0", rendered)
-            self.assertNotIn("repo-q4__replica_1", rendered)
-            self.assertIn("CUDA_VISIBLE_DEVICES=0,1,2", rendered)
+            self.assertEqual(config_path.read_bytes(), before)
+            self.assertEqual(config_path.stat().st_mtime_ns, before_mtime)
 
     def test_dynamic_replica_route_uses_cuda_visible_devices_and_matrix_vars(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5288,19 +5313,26 @@ class InstallHelpersTest(unittest.TestCase):
             rendered = yaml.safe_load("\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#")))
             models = rendered["models"]
             self.assertIn("repo-q4", models)
-            self.assertNotIn("repo-q4__replica_0", models)
-            self.assertNotIn("repo-q4__replica_1", models)
             self.assertEqual(models["repo-q4"]["aliases"], ["public-alias"])
+            # The base owns cards 0,1, so the exclusive pool hands the replica 2,3.
+            self.assertIn("repo-q4__replica_0", models)
+            self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=2,3", models["repo-q4__replica_0"]["cmd"])
+            self.assertIn("--tensor-split 1,1", models["repo-q4__replica_0"]["cmd"])
+            self.assertIn("--device CUDA0,CUDA1", models["repo-q4__replica_0"]["cmd"])
+            self.assertNotIn("--tensor-split 1,1,1,1", models["repo-q4__replica_0"]["cmd"])
+            self.assertNotIn("aliases", models["repo-q4__replica_0"])
 
-            ensure_replica_route_in_llamaswap_config(model, 0, [0, 1], [model], config_path, root / "llama-server", 10)
-            ensure_replica_route_in_llamaswap_config(model, 1, [2, 3], [model], config_path, root / "llama-server", 10)
+            before = config_path.read_bytes()
+            ensure_replica_route_in_llamaswap_config(model, 0, [2, 3], [model], config_path, root / "llama-server", 10)
+            self.assertEqual(config_path.read_bytes(), before)
+            ensure_replica_route_in_llamaswap_config(model, 1, [0, 1], [model], config_path, root / "llama-server", 10)
 
             rendered = yaml.safe_load("\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#")))
             models = rendered["models"]
             self.assertIn("repo-q4__replica_0", models)
             self.assertIn("repo-q4__replica_1", models)
-            self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=0,1", models["repo-q4__replica_0"]["cmd"])
-            self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=2,3", models["repo-q4__replica_1"]["cmd"])
+            self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=2,3", models["repo-q4__replica_0"]["cmd"])
+            self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=0,1", models["repo-q4__replica_1"]["cmd"])
             self.assertIn("--tensor-split 1,1", models["repo-q4__replica_0"]["cmd"])
             self.assertIn("--device CUDA0,CUDA1", models["repo-q4__replica_0"]["cmd"])
             self.assertNotIn("--tensor-split 1,1,1,1", models["repo-q4__replica_0"]["cmd"])
@@ -5446,15 +5478,15 @@ class InstallHelpersTest(unittest.TestCase):
             with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=7):
                 render_llamaswap_config([model], config_path, root / "llama-server", 18080, idle_ttl=10)
             rendered = yaml.safe_load("\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#")))
-            self.assertNotIn("seven-gpu-model__replica_0", rendered["models"])
-            ensure_replica_route_in_llamaswap_config(model, 0, [0, 1], [model], config_path, root / "llama-server", 10)
-            rendered = yaml.safe_load("\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#")))
             cmd = rendered["models"]["seven-gpu-model__replica_0"]["cmd"]
             self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=0,1", cmd)
             self.assertIn("--tensor-split 1,1", cmd)
             self.assertIn("--device CUDA0,CUDA1", cmd)
             self.assertNotIn("--tensor-split 1,1,1,1,1,1,1", cmd)
             self.assertIn("--main-gpu 0", cmd)
+            before = config_path.read_bytes()
+            ensure_replica_route_in_llamaswap_config(model, 0, [0, 1], [model], config_path, root / "llama-server", 10)
+            self.assertEqual(config_path.read_bytes(), before)
 
 
     def test_base_model_with_short_tensor_split_emits_device_limit(self) -> None:
@@ -5746,7 +5778,7 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertEqual(first, "repo-q4")
         self.assertEqual(second, "repo-q4")
 
-    def test_select_replica_creates_route_on_demand(self) -> None:
+    def test_select_replica_reuses_the_route_the_render_published(self) -> None:
         REPLICA_ROUTER_STATE.records.clear()
         REPLICA_ROUTER_STATE.affinity.clear()
         REPLICA_ROUTER_STATE.base_in_flight.clear()
@@ -5764,8 +5796,11 @@ class InstallHelpersTest(unittest.TestCase):
                 tensor_split="1",
                 server_overrides={"replicas": {"enabled": True, "max": 2, "gpus_per_replica": 1, "safety_vram_mib": 1}},
             )
-            render_llamaswap_config([model], config_path, root / "llama-server", 18080, idle_ttl=10)
-            self.assertNotIn("repo-q4__replica_0", config_path.read_text(encoding="utf-8"))
+            with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2):
+                render_llamaswap_config([model], config_path, root / "llama-server", 18080, idle_ttl=10)
+            self.assertIn("repo-q4__replica_0", config_path.read_text(encoding="utf-8"))
+            before = config_path.read_bytes()
+            before_mtime = config_path.stat().st_mtime_ns
             REPLICA_ROUTER_STATE.base_in_flight["repo-q4"] = 1
             with (
                 mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
@@ -5788,6 +5823,10 @@ class InstallHelpersTest(unittest.TestCase):
             rendered = config_path.read_text(encoding="utf-8")
             self.assertIn("repo-q4__replica_0", rendered)
             self.assertNotIn("repo-q4__replica_1", rendered)
+            # The scale-out route already existed, so picking it wrote nothing: a write
+            # here would make llama-swap unload every model and drop every KV cache.
+            self.assertEqual(config_path.read_bytes(), before)
+            self.assertEqual(config_path.stat().st_mtime_ns, before_mtime)
 
     def test_select_replica_uses_ready_empty_then_sticky(self) -> None:
         REPLICA_ROUTER_STATE.records.clear()
@@ -5805,6 +5844,7 @@ class InstallHelpersTest(unittest.TestCase):
         with (
             mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
             mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"repo-q4__replica_0"}),
+            mock.patch("llamacpp_stack._cli_impl._placement_fits", return_value=(True, 4096.0)),
         ):
             selected, affinity, is_replica = select_replica_for_request(model, {"messages": [{"role": "user", "content": "a"}]}, {"thread-id": "t1"})
             selected_again, _, _ = select_replica_for_request(model, {"messages": [{"role": "user", "content": "b"}]}, {"thread-id": "t1"})
@@ -6071,8 +6111,13 @@ class InstallHelpersTest(unittest.TestCase):
             with (
                 mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=1),
                 mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"m__replica_0"}),
+                mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={0: {"free_mib": 10000, "total_mib": 10000}}),
             ):
-                self.assertEqual("m", select_replica_for_request(exclusive, {"messages": [{"role": "user", "content": "a"}]}, {"thread-id": "a"})[0])
+                # One card, and it is its own base's: two 1 MiB copies fit there, so
+                # exclusive_gpus falls back to sharing it instead of publishing
+                # nothing. pack_small_models is the separate opt-in that lets two
+                # *different* small models share.
+                self.assertEqual(replica_model_id("m", 0), select_replica_for_request(exclusive, {"messages": [{"role": "user", "content": "a"}]}, {"thread-id": "a"})[0])
                 REPLICA_ROUTER_STATE.records.clear(); REPLICA_ROUTER_STATE.affinity.clear(); REPLICA_ROUTER_STATE.base_in_flight["p"] = 1
                 with (
                     mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"p__replica_0", "p__replica_1"}),

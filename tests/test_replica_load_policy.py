@@ -31,10 +31,12 @@ from dataclasses import replace
 
 from llamacpp_stack import _cli_impl
 from llamacpp_stack.cli import daemon as daemon_mod
+from llamacpp_stack.cli import models as models_mod
 from llamacpp_stack.cli import replica as R
 from llamacpp_stack.cli import ManagedModel, normalize_server_config_payload
 from llamacpp_stack.cli.models import ReplicaConfig, ReplicaRecord
 from llamacpp_stack.cli.replica import get_model_replica_config
+from llamacpp_stack.cli.replica_policy import TargetState
 
 BASE_ID = "base-model"
 OTHER_ID = "other-model"
@@ -135,7 +137,8 @@ class _RouterStateMixin:
     def reset_router_state(self):
         state = _cli_impl.REPLICA_ROUTER_STATE
         for attr in ("records", "affinity", "response_to_replica", "loading_claims",
-                     "loading_claim_aliases", "gpu_demand"):
+                     "loading_claim_aliases", "gpu_demand", "base_busy_since",
+                     "affinity_owner_pid", "base_pid"):
             getattr(state, attr).clear()
         state.base_in_flight.clear()
         state.base_last_used.clear()
@@ -143,6 +146,9 @@ class _RouterStateMixin:
         for clear in (state.records.clear, state.affinity.clear, state.response_to_replica.clear,
                       state.loading_claims.clear, state.loading_claim_aliases.clear,
                       state.gpu_demand.clear,
+                      state.base_busy_since.clear,
+                      state.affinity_owner_pid.clear,
+                      state.base_pid.clear,
                       state._health_cache.clear, state.base_in_flight.clear, state.base_last_used.clear):
             self.addCleanup(clear)
 
@@ -353,6 +359,8 @@ class RejectIfGpuBusyTest(unittest.TestCase, _RouterStateMixin):
             "plan_runtime_placement": _cli_impl.plan_runtime_placement,
             "retire_idle_occupants": _cli_impl.retire_idle_occupants,
             "apply_repin": _cli_impl.apply_repin,
+            "evict_disposable_route_for_load": mock.Mock(return_value=False),
+            "effective_model_gpu_set": _cli_impl.effective_model_gpu_set,
             "get_catalog_model_process": mock.Mock(return_value=None),
             "get_gpu_conflict_message": mock.Mock(return_value=None),
             "get_model_activity_snapshot": mock.Mock(return_value=({}, None)),
@@ -566,50 +574,175 @@ class SelectReplicaGuardsTest(unittest.TestCase, _RouterStateMixin):
         )
 
     # -- the cold scale-out loop -------------------------------------------- #
-    def test_the_grace_window_blocks_cold_scale_out_after_a_recent_base_use(self):
+    def test_an_idle_base_serves_instead_of_cold_scaling_out(self):
         _ready_replica(self.state, status="cold")
-        self.state.base_last_used[BASE_ID] = self.now - 30.0
-        self.model.server_overrides["replicas"]["idle_grace_s"] = 600
-        self._select("c4")
+        self.state.base_last_used[BASE_ID] = self.now - 601.0
+        selected, _key, is_replica = self._select("c4")
+        self.assertEqual((selected, is_replica), (BASE_ID, False))
         self.ensure_mock.assert_not_called()
         self.assertIn("replica_scale_out_deferred", self._event_names())
 
-    def test_the_grace_window_does_not_apply_to_a_never_used_base(self):
+    def test_an_idle_base_serves_even_after_a_long_idle_period(self):
+        _ready_replica(self.state, status="cold")
+        self.state.base_last_used[BASE_ID] = self.now - 86_400.0
+        selected, _key, is_replica = self._select("c5")
+        self.assertEqual((selected, is_replica), (BASE_ID, False))
+        self.ensure_mock.assert_not_called()
+
+    def test_a_never_used_base_is_loaded_before_a_cold_replica(self):
         _ready_replica(self.state, status="cold")
         self.state.base_last_used.pop(BASE_ID, None)
-        self.model.server_overrides["replicas"]["idle_grace_s"] = 600
-        selected, _key, is_replica = self._select("c5")
-        self.assertEqual(
-            (selected, is_replica), (REPLICA_ID, True),
-            "a brand-new model must always be allowed to start",
-        )
-
-    def test_the_grace_window_expires(self):
-        _ready_replica(self.state, status="cold")
-        self.state.base_last_used[BASE_ID] = self.now - 601.0
-        self.model.server_overrides["replicas"]["idle_grace_s"] = 600
         selected, _key, is_replica = self._select("c6")
-        self.assertEqual((selected, is_replica), (REPLICA_ID, True))
+        self.assertEqual((selected, is_replica), (BASE_ID, False))
+        self.ensure_mock.assert_not_called()
 
-    def test_a_zero_grace_window_disables_the_gate(self):
+    def test_a_busy_base_may_cold_scale_out(self):
         _ready_replica(self.state, status="cold")
         self.state.base_last_used[BASE_ID] = self.now - 1.0
-        self.model.server_overrides["replicas"]["idle_grace_s"] = 0
+        self.state.base_in_flight[BASE_ID] = 1
         selected, _key, is_replica = self._select("c7")
         self.assertEqual((selected, is_replica), (REPLICA_ID, True))
+        self.assertIn("replica_selected_cold", self._event_names())
         self.assertNotIn("replica_scale_out_deferred", self._event_names())
+
+    def test_prefer_base_over_replica_blocks_cold_scale_out_while_busy(self):
+        _ready_replica(self.state, status="cold")
+        self.state.base_last_used[BASE_ID] = self.now - 1.0
+        self.state.base_in_flight[BASE_ID] = 1
+        self.model.server_overrides["replicas"]["prefer_base_over_replica"] = True
+        selected, _key, is_replica = self._select("c8")
+        self.assertEqual((selected, is_replica), (BASE_ID, False))
+        self.ensure_mock.assert_not_called()
+
+    def test_a_reloaded_owner_is_rebound_as_a_new_conversation(self):
+        _ready_replica(self.state, status="ready", last_used=0.0)
+        payload = {"messages": [{"role": "user", "content": "generation"}]}
+        affinity_key = _cli_impl.resolve_request_affinity_key(BASE_ID, payload, {"thread-id": "generation"})
+        self.state.base_pid[BASE_ID] = 111
+        self.state.bind(
+            affinity_key,
+            BASE_ID,
+            _cli_impl._TransferReason.INITIAL_BIND,
+            ttl_s=3600.0,
+            cfg=self.state.affinity_config(),
+            now=self.now,
+        )
+        self.state.base_last_used[BASE_ID] = self.now - 1.0
+        self.state.base_pid[BASE_ID] = 222
+        selected, _key, is_replica = self._select("generation", payload)
+        self.assertEqual((selected, is_replica), (REPLICA_ID, True))
+        self.assertIn("affinity_owner_generation_changed", self._event_names())
+
+    def _bind_base(self, thread_id: str, payload: dict, *, age_s: float = 200.0):
+        key = _cli_impl.resolve_request_affinity_key(BASE_ID, payload, {"thread-id": thread_id})
+        self.state.bind(
+            key,
+            BASE_ID,
+            _cli_impl._TransferReason.INITIAL_BIND,
+            ttl_s=3600.0,
+            cfg=self.state.affinity_config(),
+            now=self.now - age_s,
+        )
+        return key
+
+    def _spillover_enabled(self):
+        return mock.patch.object(
+            _cli_impl,
+            "_resolve_affinity_spillover_config",
+            return_value={"enabled": True, "idle_threshold_s": 30},
+        )
+
+    def test_a_saturated_base_spills_to_a_warm_replica_after_the_threshold(self):
+        _ready_replica(self.state, status="ready", last_used=0.0)
+        payload = {"messages": [{"role": "user", "content": "spill"}]}
+        self._bind_base("spill", payload)
+        self.state.base_in_flight[BASE_ID] = _cli_impl._replica_target_capacity()
+        self.state.base_busy_since[BASE_ID] = self.now - 31.0
+        with self._spillover_enabled():
+            selected, _key, is_replica = self._select("spill", payload)
+        self.assertEqual((selected, is_replica), (REPLICA_ID, True))
+        self.assertIn("affinity_spillover_saturated", self._event_names())
+
+    def test_a_saturated_base_does_not_spill_before_the_threshold(self):
+        _ready_replica(self.state, status="ready", last_used=0.0)
+        payload = {"messages": [{"role": "user", "content": "spill-early"}]}
+        self._bind_base("spill-early", payload)
+        self.state.base_in_flight[BASE_ID] = _cli_impl._replica_target_capacity()
+        self.state.base_busy_since[BASE_ID] = self.now - 5.0
+        with self._spillover_enabled():
+            selected, _key, is_replica = self._select("spill-early", payload)
+        self.assertEqual((selected, is_replica), (BASE_ID, False))
+        self.assertNotIn("affinity_spillover_saturated", self._event_names())
+
+    def test_a_cold_replica_is_not_a_spillover_target(self):
+        _ready_replica(self.state, status="cold")
+        payload = {"messages": [{"role": "user", "content": "spill-cold"}]}
+        self._bind_base("spill-cold", payload)
+        self.state.base_in_flight[BASE_ID] = _cli_impl._replica_target_capacity()
+        self.state.base_busy_since[BASE_ID] = self.now - 100.0
+        with self._spillover_enabled():
+            selected, _key, is_replica = self._select("spill-cold", payload)
+        self.assertEqual((selected, is_replica), (BASE_ID, False))
+        self.assertNotIn("affinity_spillover_saturated", self._event_names())
+
+    def test_a_busy_replica_is_not_a_spillover_target(self):
+        _ready_replica(self.state, status="ready", in_flight=1)
+        payload = {"messages": [{"role": "user", "content": "spill-busy"}]}
+        self._bind_base("spill-busy", payload)
+        self.state.base_in_flight[BASE_ID] = _cli_impl._replica_target_capacity()
+        self.state.base_busy_since[BASE_ID] = self.now - 100.0
+        with self._spillover_enabled():
+            selected, _key, is_replica = self._select("spill-busy", payload)
+        self.assertEqual((selected, is_replica), (BASE_ID, False))
+        self.assertNotIn("affinity_spillover_saturated", self._event_names())
+
+    def test_the_spillover_respects_the_min_dwell_brake(self):
+        _ready_replica(self.state, status="ready", last_used=0.0)
+        payload = {"messages": [{"role": "user", "content": "spill-fresh"}]}
+        self._bind_base("spill-fresh", payload, age_s=10.0)
+        self.state.base_in_flight[BASE_ID] = _cli_impl._replica_target_capacity()
+        self.state.base_busy_since[BASE_ID] = self.now - 100.0
+        with self._spillover_enabled():
+            selected, _key, is_replica = self._select("spill-fresh", payload)
+        self.assertEqual((selected, is_replica), (BASE_ID, False))
+        self.assertNotIn("affinity_spillover_saturated", self._event_names())
+        self.assertIn("affinity_transfer_deferred", self._event_names())
+
+    def test_a_saturated_replica_is_never_spilled_to_the_base(self):
+        _ready_replica(
+            self.state,
+            status="ready",
+            in_flight=_cli_impl._replica_target_capacity(),
+            last_used=0.0,
+        )
+        payload = {"messages": [{"role": "user", "content": "spill-reverse"}]}
+        key = _cli_impl.resolve_request_affinity_key(BASE_ID, payload, {"thread-id": "spill-reverse"})
+        self.state.bind(
+            key,
+            REPLICA_ID,
+            _cli_impl._TransferReason.INITIAL_BIND,
+            ttl_s=3600.0,
+            cfg=self.state.affinity_config(),
+            now=self.now - 200.0,
+        )
+        self.state.base_in_flight[BASE_ID] = 0
+        self.state.base_busy_since[BASE_ID] = self.now - 100.0
+        with self._spillover_enabled():
+            selected, _key, is_replica = self._select("spill-reverse", payload)
+        self.assertEqual((selected, is_replica), (REPLICA_ID, True))
+        self.assertNotIn("affinity_spillover_saturated", self._event_names())
 
     def test_a_blocker_blocks_cold_scale_out_and_names_the_blocker(self):
         _ready_replica(self.state, status="cold")
         self.state.base_last_used.pop(BASE_ID, None)
         self._conflicting_claim()
-        selected, _key, is_replica = self._select("c8")
+        selected, _key, is_replica = self._select("c9")
         self.assertEqual((selected, is_replica), (BASE_ID, False))
         self.ensure_mock.assert_not_called()
         deferred = [d for name, d in self.log_events if name == "replica_scale_out_deferred"]
         self.assertEqual(len(deferred), 1)
         self.assertEqual(deferred[0]["blocker"], OTHER_ID)
-        self.assertIn("grace_s", deferred[0])
+        self.assertIn("base_in_flight", deferred[0])
         self.assertIn("base_last_used", deferred[0])
 
     # -- config plumbing ---------------------------------------------------- #
@@ -629,6 +762,56 @@ class SelectReplicaGuardsTest(unittest.TestCase, _RouterStateMixin):
         cfg = get_model_replica_config(bare, dict(defaults))
         self.assertFalse(cfg.prefer_base_over_replica)
         self.assertEqual((cfg.idle_grace_s, cfg.max_idle_s), (600, 1800))
+
+
+# --------------------------------------------------------------------------- #
+# health truthfulness: a route record is not a live process
+# --------------------------------------------------------------------------- #
+class BaseBusyWindowTest(unittest.TestCase, _RouterStateMixin):
+    def setUp(self):
+        self.reset_router_state()
+        self.state = _cli_impl.REPLICA_ROUTER_STATE
+
+    def test_the_window_stays_until_the_last_request_finishes(self):
+        self.state.request_started(BASE_ID)
+        started = self.state.base_busy_since[BASE_ID]
+        self.state.request_started(BASE_ID)
+        self.assertEqual(self.state.base_busy_since[BASE_ID], started)
+        self.state.request_finished(BASE_ID)
+        self.assertIn(BASE_ID, self.state.base_busy_since)
+        self.state.request_finished(BASE_ID)
+        self.assertNotIn(BASE_ID, self.state.base_busy_since)
+
+
+class RouterHealthTruthfulnessTest(unittest.TestCase, _RouterStateMixin):
+    def setUp(self):
+        self.reset_router_state()
+        self.state = _cli_impl.REPLICA_ROUTER_STATE
+
+    def _record(self, status: str, *, pid=None, port=18113):
+        self.state.records[REPLICA_ID] = ReplicaRecord(
+            base_model_id=BASE_ID,
+            replica_model_id=REPLICA_ID,
+            gpu_set=[1],
+            status=status,
+            pid=pid,
+            port=port,
+        )
+        return self.state.health_of(REPLICA_ID)
+
+    def test_a_cold_record_without_a_process_is_cold_not_ready(self):
+        health = self._record("cold", pid=None)
+        self.assertIs(health.state, TargetState.COLD)
+        self.assertFalse(health.confirmed_dead)
+
+    def test_a_loading_record_without_a_process_is_loading(self):
+        self.assertIs(self._record("loading", pid=None).state, TargetState.LOADING)
+
+    def test_an_unknown_record_is_cold(self):
+        self.assertIs(self.state.health_of("never-seen").state, TargetState.COLD)
+
+    def test_a_ready_record_without_process_telemetry_stays_ready(self):
+        self.assertIs(self._record("ready", pid=None).state, TargetState.READY)
 
 
 # --------------------------------------------------------------------------- #
@@ -1225,11 +1408,22 @@ class PreflightUsesTheAssignedCardTest(unittest.TestCase):
 
 
 class ReplicaStaysOffReservedGpusTest(unittest.TestCase):
-    """A replica must not take the only card another model's base was assigned.
+    """A reserved card is the *last resort* for a replica, not a forbidden one.
 
-    Replicas are cheaper to evict (0.5x), so one landing on a neighbour's card
-    wins the eviction, then the neighbour's request takes the card back: the two
-    trade the GPU on every turn.
+    Two big models over two cards means every card is somebody's base, and the
+    exclusive pool is empty - which is exactly what made ``replicas.enabled``
+    publish nothing at all on the two-4090 host. So a replica may take a card
+    another model's base owns, but only after the two better homes are closed:
+
+    1. a card no base owns (an unused card);
+    2. the replica's *own* base's card, charged two copies, since two copies of one
+       model hold no neighbour hostage;
+    3. only then a neighbour's card, charged this replica's single share - because
+       this model's base is not there, only one process lands on it.
+
+    Tier 3 is safe because ``evict_costs`` prices a replica at half its base, so
+    llama-swap drops the spare copy rather than the base that owns the card, and a
+    displaced neighbour has its own per-card ``<model_id>__gpuN`` route to move to.
     """
 
     def setUp(self):
@@ -1252,16 +1446,101 @@ class ReplicaStaysOffReservedGpusTest(unittest.TestCase):
     def _model(self, model_id: str):
         return next(m for m in self.catalog if m.model_id == model_id)
 
-    def _sets(self, model_id: str) -> list[list[int]]:
+    def _sets(
+        self,
+        model_id: str,
+        *,
+        total: int = 2,
+        cfg: ReplicaConfig | None = None,
+        catalog: list | None = None,
+    ) -> list[list[int]]:
+        catalog = self.catalog if catalog is None else catalog
+        model = next(m for m in catalog if m.model_id == model_id)
         return R._replica_gpu_sets(
-            self._model(model_id), self.cfg, 2,
-            base_gpu_set=self.assignment.get(model_id),
-            reserved_gpu_set=R.reserved_base_gpus(self.catalog, model_id, 2),
+            model, cfg or self.cfg, total,
+            base_gpu_set=R.assign_model_gpu_sets(catalog, total).get(model_id),
+            reserved_gpu_set=R.reserved_base_gpus(catalog, model_id, total),
         )
 
-    def test_no_replica_is_offered_when_every_card_is_a_base(self):
-        self.assertEqual(self._sets("heavy-a"), [])
-        self.assertEqual(self._sets("heavy-b"), [])
+    def _runtime_mib(self, model_id: str) -> float:
+        return float(models_mod.estimate_model_runtime_mib(self._model(model_id)))
+
+    def test_a_neighbours_card_is_the_last_resort_not_a_forbidden_one(self):
+        # Precondition: on two cards neither model has a card free, and neither
+        # model's own card can hold two copies, so only tier 3 is left.
+        self.assertEqual(self.assignment, {"heavy-a": [0], "heavy-b": [1]})
+        for model_id in ("heavy-a", "heavy-b"):
+            self.assertFalse(
+                R._replica_fits_cards(
+                    self._model(model_id), self.cfg, self.assignment[model_id],
+                    set(self.assignment[model_id]),
+                ),
+                model_id,
+            )
+
+        # heavy-a owns 0, so the only card left for it is heavy-b's 1 - and only
+        # its own share is charged there, because its base is not on that card.
+        self.assertEqual(self._sets("heavy-a"), [[1]])
+        self.assertEqual(self._sets("heavy-b"), [[0]])
+        for model_id, gpu_set in (("heavy-a", [1]), ("heavy-b", [0])):
+            self.assertNotEqual(gpu_set, self.assignment[model_id], model_id)
+            self.assertLessEqual(
+                self._runtime_mib(model_id) + self.cfg.safety_vram_mib,
+                self.cfg.gpu_capacity_mib,
+                model_id,
+            )
+
+    def test_an_unused_card_wins_over_a_neighbours_card(self):
+        # Tier 1 stays ahead of tier 3: card 2 belongs to no base, so the replica
+        # goes there rather than onto a card somebody is already using.
+        self.assertEqual(
+            self._sets("heavy-a", total=3),
+            [[2]],
+        )
+
+    def test_the_models_own_card_wins_when_it_holds_both_copies(self):
+        # Tier 2 stays ahead of tier 3. A third, small model is pinned to card 0
+        # next to heavy-a; two copies of it fit there, so its replica goes to card 0
+        # rather than to the neighbour's card 1 that tier 3 would have offered.
+        catalog = self.catalog + [
+            replace(_make_model("small", tensor_split="1"), local_path=self._sparse("c.safetensors", 5000))
+        ]
+        assignment = R.assign_model_gpu_sets(catalog, 2)
+        self.assertEqual(assignment["small"], [0])
+        small = next(m for m in catalog if m.model_id == "small")
+        self.assertTrue(
+            R._replica_fits_cards(small, self.cfg, [0], {0}),
+            "precondition: two copies fit the card the base is already pinned to",
+        )
+        self.assertEqual(
+            self._sets("small", catalog=catalog),
+            [[0]],
+            "tier 2 wins, so the neighbour's card 1 that tier 3 offers is never taken",
+        )
+
+    def test_a_multi_gpu_replica_never_takes_a_neighbours_card(self):
+        # Tier 3 is gated on gpus_per_replica == 1. A replica spanning several cards
+        # charged a single share per card is the case where the charge stops
+        # describing the card, so a wide replica gets no fallback at all.
+        wide = ReplicaConfig(
+            enabled=True, max=2, gpus_per_replica=2, placement="exclusive_gpus",
+            gpu_capacity_mib=self.cfg.gpu_capacity_mib, safety_vram_mib=self.cfg.safety_vram_mib,
+        )
+        self.assertEqual(self._sets("heavy-a", cfg=wide), [])
+
+    def test_a_replica_that_fits_no_single_card_is_not_offered_at_all(self):
+        # Tier 3 charges one share, so raising the required footprint above a whole
+        # card closes every tier at once - including the neighbour's.
+        cfg = ReplicaConfig(
+            enabled=True, max=2, gpus_per_replica=1, placement="exclusive_gpus",
+            gpu_capacity_mib=4096, safety_vram_mib=self.cfg.safety_vram_mib,
+        )
+        for model_id in ("heavy-a", "heavy-b"):
+            self.assertGreater(
+                self._runtime_mib(model_id) + cfg.safety_vram_mib, cfg.gpu_capacity_mib,
+                model_id,
+            )
+            self.assertEqual(self._sets(model_id, cfg=cfg), [])
 
     def test_reserved_base_gpus_exclude_only_the_other_models(self):
         self.assertEqual(R.reserved_base_gpus(self.catalog, "heavy-a", 2), {1})
@@ -1412,6 +1691,10 @@ class RefusalRegistersDemandTest(unittest.TestCase, _RouterStateMixin):
             "plan_runtime_placement": _cli_impl.plan_runtime_placement,
             "retire_idle_occupants": _cli_impl.retire_idle_occupants,
             "apply_repin": _cli_impl.apply_repin,
+            # The real one, so an empty catalog has to short-circuit it back to False
+            # and leave the refusal below untouched.
+            "evict_disposable_route_for_load": _cli_impl.evict_disposable_route_for_load,
+            "effective_model_gpu_set": _cli_impl.effective_model_gpu_set,
             "get_catalog_model_process": mock.Mock(return_value=None),
             "get_gpu_conflict_message": mock.Mock(return_value=self.CONFLICT),
             "cached_model_gpu_sets": mock.Mock(return_value={"wants-gpu-1": [1]}),

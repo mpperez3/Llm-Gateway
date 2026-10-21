@@ -137,6 +137,12 @@ from llamacpp_stack.cli.vision import (  # type: ignore
     normalize_mmproj_config,
 )
 
+# Unconditional re-export, not the late-import block below: five call sites in this
+# module resolve this name as a global, and cli.models owns the single estimator that
+# every capacity decision must share. A module-level binding is what keeps
+# mock.patch.object(_cli_impl, "estimate_model_runtime_mib") intercepting those calls.
+from llamacpp_stack.cli.models import estimate_model_runtime_mib  # noqa: F401  # type: ignore
+
 # Gateway shim: prefer canonical impl from llamacpp_stack.cli.gateway (T5)
 try:
     from llamacpp_stack.cli.gateway import (  # type: ignore
@@ -427,6 +433,7 @@ DEFAULT_LAST_CHAT_RESPONSE_LOG_PATH = Path(_env_value(
     "HEIMDALL_GATEWAY_LAST_CHAT_RESPONSE_LOG",
     str(DEFAULT_REQUESTS_LOG_PATH.with_name("last-chat-response.json")),
 )).expanduser()
+DEFAULT_TOOL_INTENT_CAPTURE_DIR = DEFAULT_REQUESTS_LOG_PATH.with_name("tool-intent-captures")
 SYSTEM_REQUESTS_LOG_PATH = Path(f"/var/lib/{PRODUCT_SLUG}/api-requests.log")
 
 
@@ -1021,12 +1028,95 @@ def _write_chat_last_response_log(
         log_api_event("openai_chat_last_response_log_error", {"request_id": request_id, "path": str(path), "error": str(exc)})
 
 
+def resolve_tool_intent_capture_config(args = None) -> dict[str, object]:
+    raw = _load_server_config_payload(args).get("experimental")
+    cfg = _normalize_experimental_config(raw).get("tool_intent_capture", {})
+    if not isinstance(cfg, dict):
+        cfg = dict(_default_experimental_config()["tool_intent_capture"])
+    return cfg
+
+
+def _capture_tool_intent_failure(
+    args,
+    *,
+    request_id: str,
+    model: str,
+    upstream_model: str | None,
+    stream: bool,
+    payload: object,
+    response: dict[str, object],
+) -> None:
+    cfg = resolve_tool_intent_capture_config(args)
+    if not bool(cfg.get("enabled")):
+        return
+    if isinstance(response, dict) and response.get("tool_calls"):
+        return
+    mode = str(cfg.get("mode") or "trigger").strip().lower()
+    if mode != "all":
+        tools = payload.get("tools") if isinstance(payload, dict) else None
+        if not (isinstance(tools, list) and tools):
+            return
+        repair_cfg = resolve_chat_tool_continue_repair_config(args)
+        prefixes = repair_cfg.get("trigger_prefixes") if isinstance(repair_cfg, dict) else None
+        content = str(response.get("content") or "") if isinstance(response, dict) else ""
+        if not _chat_tool_continue_trigger_reason(content, [], tools, prefixes):
+            return
+    try:
+        max_entries = max(1, int(cfg.get("max_entries", 20)))
+    except Exception:
+        max_entries = 20
+    try:
+        max_chars = max(0, int(cfg.get("max_chars", 8000000)))
+    except Exception:
+        max_chars = 8000000
+    path_text = str(cfg.get("path") or "").strip()
+    directory = Path(path_text) if path_text else DEFAULT_TOOL_INTENT_CAPTURE_DIR
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "request_id": request_id,
+            "model": model,
+            "upstream_model": upstream_model,
+            "stream": stream,
+            "mode": mode,
+            "payload": payload,
+            "response": response,
+        }
+        text = json.dumps(entry, ensure_ascii=False)
+        if max_chars and len(text) > max_chars:
+            entry["payload_truncated"] = True
+            payload_obj = entry.get("payload")
+            messages = payload_obj.get("messages") if isinstance(payload_obj, dict) else None
+            if isinstance(messages, list):
+                while len(messages) > 1 and len(text) > max_chars:
+                    messages.pop(0)
+                    text = json.dumps(entry, ensure_ascii=False)
+                entry["payload_messages_kept"] = len(messages)
+                text = json.dumps(entry, ensure_ascii=False)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        target = directory / f"intent-{stamp}-{str(request_id)[-8:]}.json"
+        tmp = target.with_name(f".{target.name}.tmp")
+        tmp.write_text(text + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+        existing = sorted(directory.glob("intent-*.json"), key=lambda p: p.stat().st_mtime)
+        for stale in existing[:-max_entries]:
+            try:
+                stale.unlink()
+            except Exception:
+                pass
+        log_api_event("openai_chat_tool_intent_captured", {"request_id": request_id, "path": str(target), "model": model, "mode": mode})
+    except Exception as exc:
+        log_api_event("openai_chat_tool_intent_capture_error", {"request_id": request_id, "error": str(exc)})
+
+
 def _default_global_replicas_config() -> dict[str, object]:
     return {
         "enabled": False,
         "max": "auto",
         "placement": "exclusive_gpus",
         "safety_vram_mib": 2048,
+        "gpu_capacity_mib": 24576,
         "prefer_base_over_replica": False,
         "idle_grace_s": 600,
         "max_idle_s": 1800,
@@ -1188,8 +1278,8 @@ def _default_auto_update_config() -> dict[str, object]:
 
 
 def _default_affinity_spillover_config() -> dict[str, object]:
-    # Off by default: the legacy spillover moved conversations whenever the
-    # owner looked busy, which is what caused cold-GPU reloads.
+    # Opt-in. The scoped spillover only targets a ready idle replica for a
+    # base-owned conversation, so enabling it cannot select a cold target.
     return {
         "enabled": False,
         "idle_threshold_s": 30,
@@ -1395,6 +1485,58 @@ def _runtime_placement_enabled(args=None, *, mode: str | None = None) -> bool:
 
 def _placement_repin_enabled(args=None) -> bool:
     return _runtime_placement_enabled(args, mode="repin")
+
+
+# Bounds for experimental.idle_gpu_warmer, in seconds, per key.
+_IDLE_WARMER_SECONDS_RANGE: tuple[tuple[str, float, float], ...] = (
+    ("poll_s", 5.0, 3600.0),
+    ("idle_after_s", 0.0, 86400.0),
+    ("cooldown_s", 0.0, 86400.0),
+    ("warm_timeout_s", 5.0, 3600.0),
+)
+
+
+def _resolve_idle_gpu_warmer_config(args=None) -> dict[str, object]:
+    """``experimental.idle_gpu_warmer``, read exactly the way ``runtime_placement`` is.
+
+    A dedicated resolver rather than an entry in ``_default_experimental_config``, because
+    this switch governs a daemon loop and never a route: default-filling the block would
+    put it in ``config-migrate``'s output, which is read as "a route needs to change".
+    Read once per tick instead of cached, so flipping the switch takes effect without a
+    restart.
+    """
+    cfg: dict[str, object] = {
+        "enabled": False,
+        "poll_s": 30.0,
+        "idle_after_s": 300.0,
+        "cooldown_s": 900.0,
+        "warm_timeout_s": 300.0,
+    }
+    try:
+        payload = _load_server_config_payload(args)
+        exp = payload.get("experimental") if isinstance(payload.get("experimental"), dict) else {}
+        raw = exp.get("idle_gpu_warmer") if isinstance(exp, dict) else None
+        if isinstance(raw, dict):
+            cfg["enabled"] = _as_bool(raw.get("enabled"), False)
+            for key, low, high in _IDLE_WARMER_SECONDS_RANGE:
+                try:
+                    cfg[key] = min(high, max(low, float(raw[key])))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return cfg
+
+
+def _idle_gpu_warmer_enabled(args=None) -> bool:
+    try:
+        return bool(_resolve_idle_gpu_warmer_config(args).get("enabled"))
+    except Exception:
+        return False
+
+
+def idle_warmer_poll_seconds(args=None) -> float:
+    return float(_resolve_idle_gpu_warmer_config(args).get("poll_s", 30.0))
 
 
 def _dedup_extract_principal(handler_self) -> str:
@@ -1626,6 +1768,13 @@ def _default_experimental_config() -> dict[str, object]:
             "max_chars": 20000,
             "include_reasoning": False,
             "include_tool_calls": True,
+        },
+        "tool_intent_capture": {
+            "enabled": False,
+            "mode": "trigger",
+            "path": "",
+            "max_entries": 20,
+            "max_chars": 8000000,
         }
     }
 
@@ -1710,6 +1859,20 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                 response_log["include_reasoning"] = _as_bool(response_log.get("include_reasoning"), False)
                 response_log["include_tool_calls"] = _as_bool(response_log.get("include_tool_calls"), True)
                 cfg["chat_last_response_log"] = response_log
+            elif key == "tool_intent_capture" and isinstance(value, dict):
+                capture = dict(cfg["tool_intent_capture"])
+                capture.update(value)
+                capture["enabled"] = _as_bool(capture.get("enabled"), False)
+                capture["mode"] = str(capture.get("mode") or "trigger").strip().lower()
+                if capture["mode"] not in {"trigger", "all"}:
+                    capture["mode"] = "trigger"
+                capture["path"] = str(capture.get("path") or "").strip()
+                for ck, dv in (("max_entries", 20), ("max_chars", 8000000)):
+                    try:
+                        capture[ck] = max(0, int(capture.get(ck, dv)))
+                    except Exception:
+                        capture[ck] = dv
+                cfg["tool_intent_capture"] = capture
             elif key == "model_probe_autoload" and isinstance(value, dict):
                 normalized, _ = _normalize_model_probe_autoload_config(value)
                 cfg["model_probe_autoload"] = normalized
@@ -2315,9 +2478,10 @@ class ReplicaConfig:
     #: on makes the redirect permanent, which costs genuine request parallelism
     #: whenever a base and a replica could both have served a conversation.
     prefer_base_over_replica: bool = False
-    #: Policy knob. How long the base must have been idle before a replica may be
-    #: spread to or created. ``0`` disables the gate. Raising it keeps a warm base
-    #: warm; lowering it trades a cold load for parallelism sooner.
+    #: Deprecated. Kept so existing configs still parse. Request-path cold
+    #: scale-out is now gated by real concurrency (a busy base), so a resident
+    #: idle base always serves; use ``experimental.idle_gpu_warmer`` to keep a
+    #: spare card warm proactively.
     idle_grace_s: int = 600
     #: Policy knob, reaper backstop. Retire a replica idle at least this long even
     #: when nothing else wants its GPU, so VRAM is handed back without waiting for
@@ -5632,13 +5796,35 @@ PLACEMENT_MAX_WRITES_PER_HOUR = 4
 _PLACEMENT_WRITE_LOG: list[float] = []
 
 
+def _target_state_from_record_status(status: object) -> object:
+    normalized = str(status or "").strip().lower()
+    if normalized == "ready":
+        return _TargetState.READY
+    if normalized == "loading":
+        return _TargetState.LOADING
+    if normalized == "dead":
+        return _TargetState.DEAD
+    if normalized == "suspect":
+        return _TargetState.SUSPECT
+    if normalized == "error":
+        return _TargetState.ERROR
+    return _TargetState.COLD
+
+
 class ReplicaRouterState:
     def __init__(self):
         self.lock = threading.RLock()
         self.records: dict[str, ReplicaRecord] = {}
         self.base_in_flight: dict[str, int] = {}
         self.base_last_used: dict[str, float] = {}
+        self.base_busy_since: dict[str, float] = {}
         self.affinity: dict[str, tuple[str, float]] = {}
+        # Process generation each affinity was bound to. A conversation is only
+        # sticky while the owner process that holds its KV cache is the same one;
+        # a reload (llama-swap TTL, eviction, crash) makes the binding stale even
+        # if the client keeps refreshing it for days.
+        self.affinity_owner_pid: dict[str, int] = {}
+        self.base_pid: dict[str, int] = {}
         self.response_to_replica: dict[str, tuple[str, float]] = {}
         self.gpu_snapshot: tuple[float, dict[int, dict[str, float]]] = (0.0, {})
         # A model load is triggered by the first request that targets an
@@ -5698,6 +5884,7 @@ class ReplicaRouterState:
                 budget.hard_transfers = 0
                 self.affinity_budget[affinity_key] = budget
                 self.affinity[affinity_key] = (target, now + ttl_s)
+                self.affinity_owner_pid[affinity_key] = self._target_pid_locked(target)
                 return _BindResult(target=target, decision=_AffinityDecision.BIND, reason=reason, bound=True)
 
             budget = self.affinity_budget.get(affinity_key) or _TransferBudget()
@@ -5726,6 +5913,7 @@ class ReplicaRouterState:
                     # pin the conversation to a corpse, serve it unbound.
                     self.affinity.pop(affinity_key, None)
                     self.affinity_budget.pop(affinity_key, None)
+                    self.affinity_owner_pid.pop(affinity_key, None)
                     log_api_event(
                         "affinity_degraded_unbound",
                         {
@@ -5763,6 +5951,7 @@ class ReplicaRouterState:
                 )
             self.policy.record_transfer(budget, reason, live[0], now)
             self.affinity[affinity_key] = (target, now + ttl_s)
+            self.affinity_owner_pid[affinity_key] = self._target_pid_locked(target)
             return _BindResult(
                 target=target,
                 decision=_AffinityDecision.EVACUATE,
@@ -5778,6 +5967,35 @@ class ReplicaRouterState:
                 return None
             return value[0]
 
+    def _target_pid_locked(self, target: str) -> int:
+        rec = self.records.get(target)
+        if rec is not None:
+            return int(rec.pid or 0)
+        return int(self.base_pid.get(target, 0) or 0)
+
+    def affinity_owner_is_stale(self, affinity_key: str, owner: str) -> bool:
+        """True when the owner process changed since this binding was created.
+
+        The affinity TTL proves the key is still being used, not that the owner
+        still holds the conversation's KV cache. A model reload keeps the key
+        alive for days while the cache is already gone, so the next request is
+        free to bind elsewhere instead of queueing behind a saturated owner.
+        """
+        with self.lock:
+            recorded = self.affinity_owner_pid.get(affinity_key)
+            if recorded is None:
+                return False
+            current = self._target_pid_locked(owner)
+        if int(recorded) <= 0 or current <= 0:
+            return False
+        return int(recorded) != current
+
+    def forget_affinity(self, affinity_key: str) -> None:
+        with self.lock:
+            self.affinity.pop(affinity_key, None)
+            self.affinity_budget.pop(affinity_key, None)
+            self.affinity_owner_pid.pop(affinity_key, None)
+
     def health_of(self, target: str, *, cfg: object = None, probe: object = None, now: float | None = None) -> _TargetHealth:
         """Measure *target*, consulting the record and a rate-limited liveness probe."""
         cfg = self.affinity_config() if cfg is None else cfg
@@ -5791,15 +6009,29 @@ class ReplicaRouterState:
                 port = int(rec.port or 0) if rec is not None else 0
             except (TypeError, ValueError):
                 pid = port = 0
-            if rec is None or pid <= 0 or port <= 0:
-                state = _TargetState.READY if rec is not None else _TargetState.COLD
+            if rec is None:
                 return _TargetHealth(
                     target=target,
-                    state=_TargetState.READY if rec is not None and rec.status == "ready" else state,
+                    state=_TargetState.COLD,
                     in_flight=in_flight,
                     capacity=max(1, _replica_target_capacity()),
                     confirmed_dead=False,
-                    blacklist_until=float(rec.blacklist_until or 0.0) if rec is not None else 0.0,
+                    blacklist_until=0.0,
+                )
+            if pid <= 0 or port <= 0:
+                # A record is not a process. ``sync_replica_runtime_state`` keeps
+                # ``port`` populated from the rendered route even when the route is
+                # cold (pid is None), so "record exists" must never be reported as
+                # READY: the reaper then "retired" every cold replica every tick
+                # and the affinity policy treated unloaded targets as serving.
+                state = _target_state_from_record_status(rec.status)
+                return _TargetHealth(
+                    target=target,
+                    state=state,
+                    in_flight=in_flight,
+                    capacity=max(1, _replica_target_capacity()),
+                    confirmed_dead=state is _TargetState.DEAD,
+                    blacklist_until=float(rec.blacklist_until or 0.0),
                 )
             snapshot = (
                 rec.status,
@@ -5838,6 +6070,10 @@ class ReplicaRouterState:
             live = set(self.affinity)
             for key in [k for k in self.affinity_budget if k not in live]:
                 self.affinity_budget.pop(key, None)
+            for key in [k for k in self.affinity_owner_pid if k not in live]:
+                self.affinity_owner_pid.pop(key, None)
+            for key in [k for k, n in self.base_in_flight.items() if int(n or 0) <= 0]:
+                self.base_busy_since.pop(key, None)
             for target, (expires, _) in list(self._health_cache.items()):
                 if expires <= now:
                     self._health_cache.pop(target, None)
@@ -5933,6 +6169,8 @@ class ReplicaRouterState:
                 if rec.status == "cold":
                     rec.status = "loading"
             else:
+                if self.base_in_flight.get(replica_id, 0) <= 0:
+                    self.base_busy_since[replica_id] = time.monotonic()
                 self.base_in_flight[replica_id] = self.base_in_flight.get(replica_id, 0) + 1
                 self.base_last_used[replica_id] = time.monotonic()
 
@@ -5966,7 +6204,10 @@ class ReplicaRouterState:
                         rec.blacklist_until = 0.0
                     rec.fatal_faults = 0
             else:
-                self.base_in_flight[replica_id] = max(0, self.base_in_flight.get(replica_id, 0) - 1)
+                remaining = max(0, self.base_in_flight.get(replica_id, 0) - 1)
+                self.base_in_flight[replica_id] = remaining
+                if remaining <= 0:
+                    self.base_busy_since.pop(replica_id, None)
                 self.base_last_used[replica_id] = time.monotonic()
 
     def base_load(self, model_id: str) -> int:
@@ -6556,29 +6797,6 @@ def _query_gpu_memory_snapshot_cached(ttl_s: float = 1.0) -> dict[int, dict[str,
     return snap
 
 
-def estimate_model_runtime_mib(model: ManagedModel) -> float | None:
-    try:
-        model_path = Path(model.local_path)
-        if model_path.is_dir():
-            size_mib = sum(
-                file_path.stat().st_size
-                for file_path in model_path.rglob("*")
-                if file_path.is_file()
-            ) / (1024 * 1024)
-        else:
-            size_mib = model_path.stat().st_size / (1024 * 1024)
-    except Exception:
-        return None
-    overrides = model.server_overrides or {}
-    ctx = int(overrides.get("ctx_size", model.ctx_size) or model.ctx_size or 8192)
-    parallel = int(overrides.get("parallel", 1) or 1)
-    batch = int(overrides.get("batch_size", 2048) or 2048)
-    ubatch = int(overrides.get("ubatch_size", 512) or 512)
-    kv_mib = (ctx * parallel * (size_mib / 2048.0) * 0.5) / 1024.0
-    compute_mib = (ubatch * 0.5) + (batch * 0.1)
-    return (size_mib * 1.08) + kv_mib + compute_mib + 700.0
-
-
 def _placement_fits(model: ManagedModel, cfg: ReplicaConfig, gpu_set: list[int], used_by_records: dict[int, int]) -> tuple[bool, float | None]:
     required = estimate_model_runtime_mib(model)
     if required is None:
@@ -6677,6 +6895,79 @@ def _find_affinity_spillover_candidate(
     return pool[0][0]
 
 
+def _find_warm_saturation_spillover_candidate(
+    replica_ids: list[str], bound_target: str, now: float
+) -> str | None:
+    best: tuple[float, str] | None = None
+    with REPLICA_ROUTER_STATE.lock:
+        for rid in replica_ids:
+            if rid == bound_target:
+                continue
+            rec = REPLICA_ROUTER_STATE.records.get(rid)
+            if rec is None or rec.blacklist_until > now:
+                continue
+            if str(rec.status) != "ready" or int(rec.in_flight or 0) > 0:
+                continue
+            candidate = (float(rec.last_used or 0.0), str(rid))
+            if best is None or candidate < best:
+                best = candidate
+    return best[1] if best is not None else None
+
+
+def _try_base_saturation_spillover(
+    base_model_id: str,
+    replica_ids: list[str],
+    owner: str,
+    affinity_key: str,
+    now: float,
+    sticky_ttl_s: float,
+) -> str | None:
+    """Move a base-owned conversation to a ready idle replica after the threshold.
+
+    Scoped on purpose: the owner must be the base, the target must already be
+    warm and free, and the reverse direction is never allowed.
+    """
+    if owner != base_model_id:
+        return None
+    cfg = _resolve_affinity_spillover_config()
+    if not bool(cfg.get("enabled")):
+        return None
+    try:
+        threshold_s = float(cfg.get("idle_threshold_s", 30))
+    except (TypeError, ValueError):
+        threshold_s = 30.0
+    busy_since = REPLICA_ROUTER_STATE.base_busy_since.get(base_model_id)
+    if busy_since is None:
+        return None
+    waited_s = now - float(busy_since)
+    if waited_s < max(0.0, threshold_s):
+        return None
+    candidate = _find_warm_saturation_spillover_candidate(replica_ids, owner, now)
+    if candidate is None:
+        return None
+    result = REPLICA_ROUTER_STATE.bind(
+        affinity_key,
+        candidate,
+        _TransferReason.EVACUATE_BASE_SATURATED,
+        ttl_s=sticky_ttl_s,
+        now=now,
+    )
+    if result.target != candidate:
+        return None
+    log_api_event(
+        "affinity_spillover_saturated",
+        {
+            "model": base_model_id,
+            "from": owner,
+            "to": candidate,
+            "affinity_key": affinity_key,
+            "waited_s": round(waited_s, 1),
+            "threshold_s": threshold_s,
+        },
+    )
+    return candidate
+
+
 def select_replica_for_request(
     base_model: ManagedModel,
     payload: dict,
@@ -6706,7 +6997,8 @@ def select_replica_for_request(
         reserved_gpu_set=reserved_base_gpus(catalog or [], base_model.model_id),
     )
     if not gpu_sets:
-        log_api_event("replica_no_gpu_sets", {"model": base_model.model_id, "replicas_max": cfg.max, "gpus_per_replica": cfg.gpus_per_replica})
+        _size_mib = _get_model_size_mib(base_model)
+        log_api_event("replica_no_gpu_sets", {"model": base_model.model_id, "replicas_max": cfg.max, "gpus_per_replica": cfg.gpus_per_replica, "size_mib": int(_size_mib), "two_copies_mib": int(2 * _size_mib + cfg.safety_vram_mib), "gpu_capacity_mib": int(cfg.gpu_capacity_mib), "safety_vram_mib": int(cfg.safety_vram_mib)})
         return base_model.model_id, affinity_key, False
     replica_ids = [replica_model_id(base_model.model_id, idx) for idx in range(len(gpu_sets))]
     published = set(published_model_ids) if published_model_ids is not None else get_published_model_ids()
@@ -6741,6 +7033,17 @@ def select_replica_for_request(
             )
             rec.gpu_set = list(gpu_sets[idx])
         owner = REPLICA_ROUTER_STATE.owner_of(affinity_key, now)
+        if owner is not None and REPLICA_ROUTER_STATE.affinity_owner_is_stale(affinity_key, owner):
+            log_api_event(
+                "affinity_owner_generation_changed",
+                {
+                    "model": base_model.model_id,
+                    "owner": owner,
+                    "affinity_key": affinity_key,
+                },
+            )
+            REPLICA_ROUTER_STATE.forget_affinity(affinity_key)
+            owner = None
         if mapped_response_replica and mapped_response_replica in replica_ids:
             REPLICA_ROUTER_STATE.bind(
                 affinity_key,
@@ -6767,8 +7070,17 @@ def select_replica_for_request(
             )
             return owner, affinity_key, owner in replica_ids
         if decision is _AffinityDecision.WAIT:
+            spilled = _try_base_saturation_spillover(
+                base_model.model_id,
+                replica_ids,
+                owner,
+                affinity_key,
+                now,
+                cfg.sticky_ttl_s,
+            )
+            if spilled is not None:
+                return spilled, affinity_key, True
             # Saturated owner: hand it back and let admission control answer 429.
-            # Returning a different target here is the bug this policy removes.
             REPLICA_ROUTER_STATE.bind(
                 affinity_key, owner, _TransferReason.STICKY_REFRESH, ttl_s=cfg.sticky_ttl_s, now=now
             )
@@ -6859,23 +7171,25 @@ def select_replica_for_request(
             )
             log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
             return base_model.model_id, affinity_key, False
-        # For a new conversation/agent with no sticky binding, prefer scaling
-        # out to a cold replica if placement fits. Reusing an idle ready replica
-        # first keeps latency low but prevents the intended multi-server spread
-        # across available GPUs for independent conversations.
+        # For a new conversation/agent with no sticky binding, reuse an idle
+        # ready replica when there is one; cold scale-out is handled below.
         used_by_records: dict[int, int] = {}
         for rec in REPLICA_ROUTER_STATE.records.values():
             if rec.status in {"ready", "loading"}:
                 for gpu in rec.gpu_set:
                     used_by_records[gpu] = used_by_records.get(gpu, 0) + 1
         cold = [r for r in candidates if r.status in {"cold", "error"}]
-        # Cold scale-out pays a full model load, so it is gated twice: never
-        # while a conflicting model is loading, and never while the base is still
-        # inside its idle grace window. A base that has never been used is exempt
-        # from the grace window, otherwise a brand-new model could never start.
-        idle_grace_s = int(cfg.idle_grace_s)
-        defer_scale_out = load_blocker is not None or (
-            idle_grace_s > 0 and base_last > 0.0 and (now - base_last) < idle_grace_s
+        # A cold replica load is only justified by real concurrency: the base is
+        # already serving another request. When the base is idle, this request
+        # belongs on the base -- resident or not -- instead of duplicating the
+        # weights on another GPU. The old rule ("scale out once the base has been
+        # idle for idle_grace_s") did the opposite: it paid a full ~2 min load on
+        # the first request after every idle period, then the reaper unloaded the
+        # replica and the next request paid it again.
+        defer_scale_out = (
+            load_blocker is not None
+            or base_load <= 0
+            or cfg.prefer_base_over_replica
         )
     if defer_scale_out:
         log_api_event(
@@ -6883,7 +7197,8 @@ def select_replica_for_request(
             {
                 "model": base_model.model_id,
                 "blocker": load_blocker[0] if load_blocker else None,
-                "grace_s": idle_grace_s,
+                "base_in_flight": base_load,
+                "prefer_base_over_replica": bool(cfg.prefer_base_over_replica),
                 "base_last_used": base_last,
             },
         )
@@ -6952,7 +7267,17 @@ def select_replica_for_request(
             )
             log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
             return base_model.model_id, affinity_key, False
-        chosen = sorted(candidates, key=lambda r: (r.in_flight, 1 if r.status == "loading" else 0, r.last_used))[0]
+        live = [r for r in candidates if r.status in {"ready", "loading"}]
+        if not live:
+            # Cold scale-out was declined (blocker, prefer-base, or no placement
+            # fit) and no second instance exists: the base is the only target.
+            # Picking a cold route here would bypass that decision and load it.
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+            )
+            log_api_event("replica_base_only_target", {"model": base_model.model_id, "affinity_key": affinity_key})
+            return base_model.model_id, affinity_key, False
+        chosen = sorted(live, key=lambda r: (r.in_flight, 1 if r.status == "loading" else 0, r.last_used))[0]
         REPLICA_ROUTER_STATE.bind(
             affinity_key, chosen.replica_model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
         )
@@ -7841,7 +8166,7 @@ def _show_local_catalog_fallback(args, reason: Exception) -> None:
     print(f"{manager_hint()}\nDetails: {reason}")
     catalog, catalog_diag = load_catalog_with_diagnostics(args.catalog)
     print("\nManager unavailable; showing local catalog view (published/loaded status may be stale).")
-    print("\n" + render_models_table(catalog, args.public_host, args.public_port, get_effective_idle_ttl(args)))
+    print("\n" + render_models_table(catalog, args.public_host, args.public_port, get_effective_idle_ttl(args), getattr(args, "config", None)))
     if catalog:
         return
     if catalog_diag:
@@ -7957,15 +8282,22 @@ def _active_llama_server_summary(catalog: list[ManagedModel] | None = None) -> s
     processes = get_llama_server_processes()
     if not processes:
         return ""
+    route_by_port = {
+        info.get("port"): (route_id, info)
+        for route_id, info in _llamaswap_route_index().items()
+    }
     names: list[str] = []
-    if catalog:
-        by_path = {_safe_realpath(model.local_path): model.model_id for model in catalog}
-        for proc in processes:
-            name = by_path.get(proc.get("model_path") or "")
-            if name:
-                names.append(f"{name}(pid={proc.get('pid')})")
-    if not names:
-        names = [f"pid={proc.get('pid')}" for proc in processes]
+    by_path = {_safe_realpath(model.local_path): model.model_id for model in (catalog or [])}
+    for proc in processes:
+        route = route_by_port.get(proc.get("port"))
+        if route is not None:
+            route_id, info = route
+            name = str(info.get("base_model") or route_id)
+            if info.get("is_replica"):
+                name = f"{name}[replica]"
+        else:
+            name = by_path.get(proc.get("model_path") or "", "")
+        names.append(f"{name}(pid={proc.get('pid')})" if name else f"pid={proc.get('pid')}")
     return ", ".join(names)
 
 
@@ -9066,6 +9398,49 @@ def _llamaswap_route_commands(config_path: Path) -> dict[str, str]:
     return dict(cmds)
 
 
+_ROUTE_INDEX_CACHE: dict[str, object] = {"key": None, "routes": {}}
+
+
+def _llamaswap_route_index(config_path: Path | str | None = None) -> dict[str, dict[str, object]]:
+    """Route id -> assigned port and base-family ownership, cached on path+mtime.
+
+    llama-swap assigns ``${PORT}`` as ``startPort + position in models``, so the
+    port in a process command line identifies its route even when two routes load
+    the same weights file. ``base_model`` collapses ``__gpuN`` variants onto the
+    catalog id; ``is_replica`` keeps internal replicas out of base attribution.
+    """
+    path = Path(config_path) if config_path is not None else Path(DEFAULT_CONFIG_PATH)
+    try:
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+    except Exception:
+        return {}
+    if _ROUTE_INDEX_CACHE.get("key") == key:
+        return dict(_ROUTE_INDEX_CACHE.get("routes") or {})
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        models = payload.get("models") or {}
+        if not isinstance(models, dict):
+            return {}
+        start_port = int(payload.get("startPort") or DEFAULT_START_PORT)
+        routes: dict[str, dict[str, object]] = {}
+        for idx, (route_id, entry) in enumerate(models.items()):
+            metadata = entry.get("metadata") if isinstance(entry, dict) else None
+            metadata = metadata if isinstance(metadata, dict) else {}
+            replica_of = str(metadata.get("internal_replica_of") or "").strip()
+            variant_of = str(metadata.get("route_variant_of") or "").strip()
+            routes[str(route_id)] = {
+                "port": start_port + idx,
+                "base_model": replica_of or variant_of or str(route_id),
+                "is_replica": bool(replica_of),
+            }
+    except Exception:
+        return {}
+    _ROUTE_INDEX_CACHE["key"] = key
+    _ROUTE_INDEX_CACHE["routes"] = routes
+    return dict(routes)
+
+
 def model_runtime_capabilities(model_id: str, config_path: Path | None = None,
                               swap_loaded: set[str] | None = None) -> dict[str, bool]:
     """What one model id can accept right now, read from its own live route.
@@ -10156,6 +10531,13 @@ def get_llama_server_processes() -> list[dict]:
 
 
 def get_loaded_catalog_model_ids(catalog: list[ManagedModel]) -> set[str]:
+    """Catalog ids with at least one live process loading their weights.
+
+    This deliberately answers "are these weights resident somewhere", including
+    an internal replica: the unload guard uses it to decide whether a model is
+    still servable. For the base route's own process use
+    :func:`get_catalog_model_process`, which disambiguates routes by port.
+    """
     processes = get_llama_server_processes()
     process_by_model = {proc["model_path"]: proc for proc in processes}
     return {
@@ -10165,12 +10547,59 @@ def get_loaded_catalog_model_ids(catalog: list[ManagedModel]) -> set[str]:
     }
 
 
-def get_catalog_model_process(model_id: str, catalog: list[ManagedModel]) -> dict | None:
+def get_catalog_model_process(
+    model_id: str,
+    catalog: list[ManagedModel],
+    *,
+    config_path: Path | str | None = None,
+    processes: list[dict] | None = None,
+    allow_replica_fallback: bool = False,
+) -> dict | None:
+    """Return the live process for *model_id*'s own route, never its replica's.
+
+    A base and its replicas read the same ``model_path``, so keying processes by
+    path attributed a replica's pid/port/GPU to the base (observed as the base
+    reporting the replica's pid and a 386 MiB footprint while it was loading).
+    The rendered route index gives every route a distinct port; use it to pick
+    the base route (or one of its ``__gpuN`` variants) and only guess by path
+    when no rendered route information exists.
+    """
     model = next((item for item in catalog if item.model_id == model_id), None)
     if model is None:
         return None
-    process_by_model = {proc["model_path"]: proc for proc in get_llama_server_processes()}
-    return process_by_model.get(_safe_realpath(model.local_path))
+    expected_path = _safe_realpath(model.local_path)
+    candidates = [
+        proc
+        for proc in (processes if processes is not None else get_llama_server_processes())
+        if proc.get("model_path") == expected_path
+    ]
+    if not candidates:
+        return None
+    routes = _llamaswap_route_index(config_path)
+    model_is_rendered = bool(
+        routes
+        and (
+            model_id in routes
+            or any(info.get("base_model") == model_id for info in routes.values())
+        )
+    )
+    if model_is_rendered:
+        exact_port = (routes.get(model_id) or {}).get("port")
+        if exact_port is not None:
+            for proc in candidates:
+                if proc.get("port") == exact_port:
+                    return proc
+        variant_ports = {
+            info.get("port")
+            for info in routes.values()
+            if info.get("base_model") == model_id and not info.get("is_replica")
+        }
+        for proc in candidates:
+            if proc.get("port") in variant_ports:
+                return proc
+        if not allow_replica_fallback:
+            return None
+    return candidates[0]
 
 
 def get_gpu_uuid_index_map() -> dict[str, int]:
@@ -10342,8 +10771,14 @@ def model_launch_gpu_set(model: ManagedModel, total_gpus: int | None = None) -> 
     return list(range(max(0, count)))
 
 
-def model_has_enough_free_vram_to_load(model: ManagedModel, *, safety_vram_mib: int = 2048, gpu_set: list[int] | None = None) -> tuple[bool, dict[str, object]]:
-    """Conservative preflight: allow coexistence only when the target estimate fits current free VRAM."""
+def model_has_enough_free_vram_to_load(model: ManagedModel, *, safety_vram_mib: int = 2048, gpu_set: list[int] | None = None, reclaimed_mib: float = 0.0) -> tuple[bool, dict[str, object]]:
+    """Conservative preflight: allow coexistence only when the target estimate fits current free VRAM.
+
+    ``reclaimed_mib`` is VRAM the caller has just handed back by unloading a route and
+    measured from that route's own footprint. The snapshot it is added to is cached for
+    a second and a killed process takes about that long to release its memory, so
+    crediting the measured amount is what makes the post-unload answer truthful.
+    """
     gpu_set = list(gpu_set) if gpu_set else model_launch_gpu_set(model)
     if not gpu_set:
         return True, {"reason": "cpu_model", "gpu_set": []}
@@ -10354,11 +10789,17 @@ def model_has_enough_free_vram_to_load(model: ManagedModel, *, safety_vram_mib: 
     if not snap:
         return False, {"reason": "missing_gpu_snapshot", "gpu_set": gpu_set, "required_total_mib": required}
     required_per_gpu = (required / max(1, len(gpu_set))) + 1024.0
+    reclaimed = max(0.0, float(reclaimed_mib or 0.0))
     checks: list[dict[str, float | int | str]] = []
     for gpu in gpu_set:
-        free = float(snap.get(gpu, {}).get("free_mib", 0.0))
+        measured = float(snap.get(gpu, {}).get("free_mib", 0.0))
+        free = measured + reclaimed
         need = required_per_gpu + safety_vram_mib
-        checks.append({"gpu": gpu, "free_mib": free, "required_mib": need})
+        check: dict[str, float | int | str] = {"gpu": gpu, "free_mib": free, "required_mib": need}
+        if reclaimed > 0.0:
+            check["measured_free_mib"] = measured
+            check["reclaimed_mib"] = reclaimed
+        checks.append(check)
         if need > free:
             return False, {
                 "reason": "insufficient_vram",
@@ -10905,7 +11346,7 @@ def plan_runtime_placement(
     model_entry = next((model for model in catalog if model.model_id == model_name), None)
     if model_entry is None or is_replica_model_id(model_name):
         return _forward_placement()
-    if get_catalog_model_process(model_name, catalog) is not None:
+    if get_catalog_model_process(model_name, catalog, allow_replica_fallback=True) is not None:
         return _forward_placement()
 
     try:
@@ -11074,6 +11515,467 @@ def apply_repin(
     return True
 
 
+def disposable_route_in_flight(route_id: str) -> int:
+    """Requests that unloading ``route_id`` right now would destroy.
+
+    A ``__replica_N`` carries its own counter and is read on its own, so a busy base
+    never freezes its spare copy. A ``__gpuN`` variant is booked under its base id
+    (the handler rewrites the payload but not the bookkeeping), so its own counter
+    stays at 0 while it streams and the base's counter is the traffic actually running
+    on that card.
+    """
+    variant_base, _gpu = split_gpu_route_variant(route_id)
+    if variant_base:
+        return max(instance_in_flight(route_id), instance_in_flight(variant_base))
+    return instance_in_flight(route_id)
+
+
+def disposable_route_victims(
+    model_id: str,
+    catalog: list[ManagedModel],
+    gpu: int,
+    *,
+    host: str = DEFAULT_PUBLIC_HOST,
+    port: int = DEFAULT_PUBLIC_PORT,
+) -> list[tuple[str, int]]:
+    """Disposable routes resident on ``gpu`` as ``(route_id, freed_mib)``, biggest first.
+
+    A base route is never a victim: it is the id clients ask for, so the only
+    candidates are the derived routes that exist to hold a spare copy - a ``__gpuN``
+    per-card variant or a ``__replica_N`` - and only while nothing is streaming.
+    """
+    try:
+        from llamacpp_stack.cli.replica import is_disposable_route_id
+    except Exception:
+        return []
+    occupants = _gpu_occupants(model_id, catalog).get(int(gpu), [])
+    if not occupants:
+        return []
+    # A __gpuN route runs the very same weights file as its base, so pgrep cannot say
+    # which of the two is resident and every variant resolves to its base id. llama-swap
+    # can: it reports the route id a request would be forwarded to, and the card is part
+    # of that id.
+    loaded_variants = {
+        route_id
+        for route_id in (get_loaded_model_ids(host, port) or set())
+        if split_gpu_route_variant(route_id)[1] == int(gpu)
+    }
+    victims: list[tuple[str, int]] = []
+    for route_id, _pid, used_mib in occupants:
+        if is_disposable_route_id(route_id):
+            route = route_id
+        elif f"{route_id}__gpu{int(gpu)}" in loaded_variants:
+            route = f"{route_id}__gpu{int(gpu)}"
+        else:
+            continue
+        if disposable_route_in_flight(route) > 0:
+            continue
+        victims.append((route, int(used_mib or 0)))
+    return sorted(victims, key=lambda victim: (-victim[1], victim[0]))
+
+
+def evict_disposable_route_for_load(
+    model_id: str,
+    catalog: list[ManagedModel],
+    target_gpus: list[int],
+    *,
+    client_host: str = DEFAULT_PUBLIC_HOST,
+    public_port: int = DEFAULT_PUBLIC_PORT,
+) -> bool:
+    """Retire one disposable route to make room for a pending load; True if it may proceed.
+
+    Called only where the admission gate was about to answer 503, so a request that
+    needs VRAM takes it from a route that exists to hold a spare copy rather than from a
+    base route that may be serving traffic. Retirement goes through llama-swap's unload
+    endpoint, so no route is rewritten and no other resident model loses its cache.
+
+    Every step is defensive: an unresolvable card, a refused or failed unload and a card
+    that is still too small all return False, which leaves the caller on its existing
+    rejection path unchanged.
+    """
+    cards = [int(gpu) for gpu in (target_gpus or [])]
+    model_entry = next((model for model in catalog if model.model_id == model_id), None)
+    if model_entry is None or not cards or is_replica_model_id(model_id):
+        return False
+    try:
+        from llamacpp_stack.cli.daemon import unload_replica_via_llamaswap
+    except Exception as exc:
+        log_api_event(
+            "disposable_route_evict_unavailable",
+            {"model": model_id, "error": repr(exc)[:200]},
+        )
+        return False
+    # Bound before the try so the handler below can name the route it was trying to
+    # sacrifice even when the enumeration itself is what blew up.
+    freed_mib, route_id, card = 0, "", (cards[0] if cards else -1)
+    try:
+        victims = [
+            (freed_mib, route_id, card)
+            for card in cards
+            for route_id, freed_mib in disposable_route_victims(
+                model_id, catalog, card, host=client_host, port=public_port
+            )
+        ]
+        if not victims:
+            return False
+        # One sacrifice, and the one that frees the most: a route that would not have made
+        # the load fit anyway is not worth giving up. The route id breaks ties.
+        freed_mib, route_id, card = max(victims, key=lambda victim: (victim[0], victim[1]))
+        if not unload_replica_via_llamaswap(route_id, client_host, public_port):
+            return False
+        fits, fit_info = model_has_enough_free_vram_to_load(
+            model_entry, gpu_set=cards, reclaimed_mib=freed_mib
+        )
+    except Exception as exc:
+        log_api_event(
+            "disposable_route_evict_failed",
+            {"model": model_id, "route": route_id, "gpu": card, "error": repr(exc)[:200]},
+        )
+        return False
+    log_api_event(
+        "disposable_route_evicted" if fits else "disposable_route_evict_insufficient",
+        {
+            "model": model_id,
+            "route": route_id,
+            "gpu": card,
+            "freed_mib": freed_mib,
+            "admitted": bool(fits),
+            **fit_info,
+        },
+    )
+    return bool(fits)
+
+
+@dataclass
+class IdleWarmerState:
+    """Per-process warmer memory. In-memory only, like the router state.
+
+    A restart re-reads live occupancy, so a persisted idle timestamp or cooldown would
+    outlive the condition it describes and warm a card that is no longer empty.
+    """
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    idle_since: dict[int, float] = field(default_factory=dict)
+    cooldown_until: dict[int, float] = field(default_factory=dict)
+    warming: dict[int, str] = field(default_factory=dict)
+
+
+_IDLE_WARMER_STATE = IdleWarmerState()
+
+
+@dataclass(frozen=True)
+class IdleWarmCandidate:
+    """A published route that could be warmed onto ``gpu``."""
+
+    route_id: str
+    base_id: str
+    gpu: int
+    size_mib: float
+    weights_resident: bool
+    model: ManagedModel = field(compare=False)
+
+
+def _idle_warmer_occupied_cards() -> set[int]:
+    """Cards a ``llama-server`` process of ours is on right now.
+
+    Both probes are needed: ``pgrep`` alone cannot place a process on a card, and the
+    nvidia-smi pid map alone cannot tell a managed server from anything else on the box.
+    """
+    pids = {int(proc["pid"]) for proc in (get_llama_server_processes() or []) if proc.get("pid")}
+    cards: set[int] = set()
+    for raw_pid, per_gpu in (get_gpu_process_memory_by_pid() or {}).items():
+        if int(raw_pid) not in pids:
+            continue
+        for gpu in (per_gpu or {}):
+            cards.add(int(gpu))
+    return cards
+
+
+def idle_warm_candidates(
+    gpu: int,
+    catalog: list[ManagedModel],
+    total_gpus: int,
+    *,
+    published: set[str],
+    loaded: set[str],
+    skip_routes: set[str] | None = None,
+) -> list[IdleWarmCandidate]:
+    """Published single-card routes that live on ``gpu``, cheapest load first.
+
+    The order is the whole selection rule, and it keys on the cost of the load itself --
+    never on which model it is:
+
+    - ``weights_resident`` first. A model that already runs somewhere has its bytes in the
+      page cache, so llama-swap re-maps a resident file instead of reading the weights
+      back off storage. That is the difference between a warm copy in seconds and one in
+      minutes, and it is why an idle card is worth warming with a second copy of a model
+      rather than with whatever the catalog happens to list first.
+    - then ``size_mib``. Among routes that are equally cheap to start the smallest is the
+      one that leaves the card most able to admit the next real load (R3), and the one a
+      later eviction is least likely to take.
+    - then ``route_id``, so two identical catalogs always pick the same route.
+
+    Only routes llama-swap publishes qualify: a route missing from its ``/v1/models``
+    cannot be asked for, and a route that needs more than one card cannot land on one card.
+    """
+    card = int(gpu)
+    skip = {str(route_id) for route_id in (skip_routes or set())}
+    assignment = cached_model_gpu_sets(catalog or [], total_gpus)
+    candidates: list[IdleWarmCandidate] = []
+    for model in catalog or []:
+        base_id = str(getattr(model, "model_id", "") or "")
+        if not base_id or is_replica_model_id(base_id):
+            continue
+        routes: list[str] = []
+        if [int(g) for g in (assignment.get(base_id) or [])] == [card] and base_id in published:
+            routes.append(base_id)
+        # gpr_variants already drops the cards the base owns, so the base route and its
+        # own per-card variant are never both offered for one card.
+        for route_id, gpu_set in gpr_variants(model, catalog or [], total_gpus):
+            if [int(g) for g in gpu_set] == [card] and route_id in published:
+                routes.append(str(route_id))
+        routes = [route_id for route_id in routes if route_id not in skip]
+        if not routes:
+            continue
+        size = estimate_model_runtime_mib(model)
+        resident = bool(loaded.intersection({base_id, *routes}))
+        for route_id in routes:
+            candidates.append(
+                IdleWarmCandidate(
+                    route_id=route_id,
+                    base_id=base_id,
+                    gpu=card,
+                    # An unmeasurable model sorts last instead of first, so a missing
+                    # estimate can never look like the cheapest route on the card.
+                    size_mib=float(size) if size is not None else float("inf"),
+                    weights_resident=resident,
+                    model=model,
+                )
+            )
+    return sorted(
+        candidates,
+        key=lambda entry: (0 if entry.weights_resident else 1, entry.size_mib, entry.route_id),
+    )
+
+
+def warm_route_via_llamaswap(route_id: str, host: str, port: int, *, timeout: float = 300.0) -> bool:
+    """Load one already-published route with the smallest request llama.cpp accepts.
+
+    This is the warmer's only mechanism. llama-swap owns the load, so the route's own
+    command decides the card, and ``config.yaml`` is never touched: a write there unloads
+    every resident model and destroys every KV cache, which is the opposite of keeping a
+    card warm. No process is spawned here either.
+    """
+    url = f"http://{_normalize_client_host(host)}:{int(port)}/v1/chat/completions"
+    try:
+        response = requests.post(
+            url,
+            json={
+                "model": route_id,
+                "messages": [{"role": "user", "content": "."}],
+                "stream": False,
+                "max_tokens": 1,
+                "temperature": 0,
+            },
+            timeout=(10, max(5.0, float(timeout))),
+        )
+        status = int(getattr(response, "status_code", 0) or 0)
+    except Exception as exc:
+        log_api_event("idle_warmer_failed", {"route": route_id, "error": repr(exc)[:200]})
+        return False
+    if status >= 400:
+        log_api_event("idle_warmer_failed", {"route": route_id, "status": status})
+        return False
+    return True
+
+
+def run_idle_warmer_tick(args, *, now: float | None = None) -> str:
+    """Keep one idle card warm; returns the route id it warmed, or ``""``.
+
+    Picks the card that has been empty longest past the threshold, then loads the
+    cheapest-to-start published route that lives on it. At most one warm-up per tick, so
+    a fleet of idle cards loads one model at a time instead of stamping the page cache.
+    Never raises: the loop that calls this has to survive any single tick.
+    """
+    try:
+        cfg = _resolve_idle_gpu_warmer_config(args)
+        if not cfg.get("enabled"):
+            return ""
+        host = str(getattr(args, "public_host", DEFAULT_PUBLIC_HOST) or DEFAULT_PUBLIC_HOST)
+        try:
+            port = int(getattr(args, "public_port", DEFAULT_PUBLIC_PORT) or DEFAULT_PUBLIC_PORT)
+        except (TypeError, ValueError):
+            port = int(DEFAULT_PUBLIC_PORT)
+        catalog, diag = load_catalog_with_diagnostics(
+            Path(getattr(args, "catalog", DEFAULT_CATALOG_PATH)),
+            _args_server_config_path(args),
+        )
+        if diag or not catalog:
+            return ""
+        total_gpus = int(detect_cuda_device_count() or 0)
+        # With one card there is nowhere else for a warm copy to live, and holding one
+        # there only evicts whatever the next request needs.
+        if total_gpus < 2:
+            return ""
+        published = get_published_model_ids(host, port)
+        loaded = get_loaded_model_ids(host, port)
+        snapshot = _query_gpu_memory_snapshot_cached()
+        if not published or not snapshot:
+            return ""
+        occupied = _idle_warmer_occupied_cards()
+        idle_after_s = float(cfg["idle_after_s"])
+        cooldown_s = float(cfg["cooldown_s"])
+    except Exception as exc:
+        log_api_event("idle_warmer_probe_failed", {"error": repr(exc)[:200]})
+        return ""
+
+    tick_now = time.monotonic() if now is None else float(now)
+    views: dict[int, dict[str, object]] = {}
+    with _IDLE_WARMER_STATE.lock:
+        for raw in sorted(snapshot):
+            card = int(raw)
+            if card in occupied:
+                # Leading edge: the idle clock only runs while the card is empty, and a
+                # card that just gained a process forgets both its clock and its
+                # cooldown, so it can never read as long-idle on the following tick.
+                _IDLE_WARMER_STATE.idle_since.pop(card, None)
+                _IDLE_WARMER_STATE.cooldown_until.pop(card, None)
+                continue
+            _IDLE_WARMER_STATE.idle_since.setdefault(card, tick_now)
+            views[card] = {
+                "idle_s": tick_now - float(_IDLE_WARMER_STATE.idle_since[card]),
+                "cooldown_until": float(_IDLE_WARMER_STATE.cooldown_until.get(card, 0.0)),
+                "warming": _IDLE_WARMER_STATE.warming.get(card, ""),
+            }
+        warming_routes = set(_IDLE_WARMER_STATE.warming.values())
+
+    for card in sorted(views, key=lambda entry: (-float(views[entry]["idle_s"]), entry)):
+        view = views[card]
+        if str(view["warming"]):
+            log_api_event(
+                "idle_warmer_refused",
+                {"gpu": card, "route": str(view["warming"]), "reason": "warm_in_flight"},
+            )
+            continue
+        if float(view["idle_s"]) < idle_after_s or tick_now < float(view["cooldown_until"]):
+            # Not due yet, or this card already had its turn at being judged.
+            continue
+        selected, refusal, refusal_detail = None, "", {}
+        for candidate in idle_warm_candidates(
+            card,
+            catalog,
+            total_gpus,
+            published=published,
+            loaded=loaded,
+            skip_routes=warming_routes,
+        ):
+            if candidate.route_id in loaded:
+                refusal, refusal_detail = "already_loaded", {"route": candidate.route_id}
+                continue
+            # disposable_route_in_flight reads a __gpuN variant's base counter as well, so
+            # this catches traffic already streaming on the weights the load would need.
+            if disposable_route_in_flight(candidate.route_id) > 0:
+                refusal, refusal_detail = "model_in_flight", {"route": candidate.route_id}
+                continue
+            fits, fit_info = model_has_enough_free_vram_to_load(candidate.model, gpu_set=[card])
+            if not fits:
+                # Nested, because model_has_enough_free_vram_to_load's own payload has a
+                # "reason" key that would otherwise overwrite the refusal's.
+                refusal, refusal_detail = "insufficient_vram", {
+                    "route": candidate.route_id,
+                    "vram": fit_info,
+                }
+                continue
+            selected = candidate
+            break
+        if selected is None:
+            if not refusal:
+                # Nothing published could ever land on this card, which is a property of
+                # the render rather than a decision: nothing to log, nothing to retry.
+                continue
+            if refusal == "insufficient_vram":
+                # Nothing published for this card fits right now, and that verdict only
+                # changes when the fleet shrinks. Cooling the card down is the trailing
+                # edge: without it the loop re-measures and re-refuses every single tick.
+                with _IDLE_WARMER_STATE.lock:
+                    _IDLE_WARMER_STATE.cooldown_until[card] = tick_now + cooldown_s
+            log_api_event(
+                "idle_warmer_refused",
+                {
+                    "gpu": card,
+                    "reason": refusal,
+                    "idle_s": round(float(view["idle_s"]), 1),
+                    **refusal_detail,
+                },
+            )
+            # Another card may still be warmable, and judging it costs no I/O: every probe
+            # this tick needed was already taken above.
+            continue
+        return _warm_idle_card(
+            selected,
+            host,
+            port,
+            idle_s=float(view["idle_s"]),
+            timeout=float(cfg["warm_timeout_s"]),
+        )
+    return ""
+
+
+def _warm_idle_card(
+    candidate: IdleWarmCandidate,
+    host: str,
+    port: int,
+    *,
+    idle_s: float,
+    timeout: float,
+) -> str:
+    """Claim the card, issue the warm-up, release the claim. Never raises."""
+    card = int(candidate.gpu)
+    claimed = False
+    with _IDLE_WARMER_STATE.lock:
+        # One warm-up per card, and never two for one route id even if two cards would
+        # answer to the same weights.
+        if card in _IDLE_WARMER_STATE.warming or candidate.route_id in set(
+            _IDLE_WARMER_STATE.warming.values()
+        ):
+            warming = _IDLE_WARMER_STATE.warming.get(card, "")
+        else:
+            _IDLE_WARMER_STATE.warming[card] = candidate.route_id
+            claimed = True
+    if not claimed:
+        log_api_event(
+            "idle_warmer_refused",
+            {"gpu": card, "route": candidate.route_id, "reason": "warm_in_flight"},
+        )
+        return ""
+    warmed = False
+    try:
+        warmed = bool(warm_route_via_llamaswap(candidate.route_id, host, port, timeout=timeout))
+    except Exception as exc:
+        log_api_event(
+            "idle_warmer_failed",
+            {"gpu": card, "route": candidate.route_id, "error": repr(exc)[:200]},
+        )
+    finally:
+        with _IDLE_WARMER_STATE.lock:
+            if _IDLE_WARMER_STATE.warming.get(card) == candidate.route_id:
+                _IDLE_WARMER_STATE.warming.pop(card, None)
+    if not warmed:
+        return ""
+    log_api_event(
+        "idle_warmer_warmed",
+        {
+            "gpu": card,
+            "route": candidate.route_id,
+            "model": candidate.base_id,
+            "reason": "weights_resident" if candidate.weights_resident else "smallest_fitting",
+            "idle_s": round(idle_s, 1),
+            "size_mib": None if candidate.size_mib == float("inf") else round(candidate.size_mib, 1),
+        },
+    )
+    return candidate.route_id
+
+
 def get_configured_idle_ttl(config_path: Path | None = None, fallback: int = DEFAULT_IDLE_TTL) -> int:
     cfg_path = config_path or DEFAULT_CONFIG_PATH
     try:
@@ -11114,18 +12016,23 @@ def classify_runtime(model: ManagedModel, loaded: bool, process_pid: int | None,
         return "cpu", planned
     return "cpu-fallback", planned
 
-def render_models_table(catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT, idle_ttl=DEFAULT_IDLE_TTL) -> str:
+def render_models_table(catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT, idle_ttl=DEFAULT_IDLE_TTL, config_path: Path | str | None = None) -> str:
     if not catalog:
         return "No models in catalog."
 
     published_models = get_published_model_ids(host, port)
     processes = get_llama_server_processes()
-    process_by_model = {proc["model_path"]: proc for proc in processes}
     gpu_process_map = get_gpu_process_map()
     rows = []
     for model in catalog:
         storage = get_model_storage_info(model)
-        process = process_by_model.get(_safe_realpath(model.local_path))
+        process = get_catalog_model_process(
+            model.model_id,
+            catalog,
+            config_path=config_path,
+            processes=processes,
+            allow_replica_fallback=True,
+        )
         published = model.model_id in published_models
         loaded = process is not None
         runtime, planned = classify_runtime(model, loaded, process["pid"] if process else None, gpu_process_map)
@@ -11389,7 +12296,7 @@ def _loaded_process_missing_configured_mmproj(model: ManagedModel, catalog: list
     if not _has_configured_mmproj_runtime(model):
         return False
     try:
-        proc = get_catalog_model_process(model.model_id, catalog)
+        proc = get_catalog_model_process(model.model_id, catalog, allow_replica_fallback=True)
     except Exception:
         return False
     if not proc:
@@ -11647,10 +12554,20 @@ def _normalize_openai_image_part(item: dict) -> dict | None:
     return None
 
 
-def _normalize_openai_message(message: dict) -> dict:
+def _normalize_openai_tool_call(tool_call: dict) -> dict:
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    arguments = function.get("arguments")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+    return {
+        "id": str(tool_call.get("id") or ""),
+        "type": str(tool_call.get("type") or "function"),
+        "function": {"name": str(function.get("name") or ""), "arguments": arguments},
+    }
+
+
+def _normalize_openai_message(message: dict, preserve_reasoning_content: bool = False) -> dict:
     role = str(message.get("role") or "user").strip() or "user"
-    if role == "tool":
-        role = "user"
     content = message.get("content")
     if isinstance(content, list):
         parts = []
@@ -11671,13 +12588,69 @@ def _normalize_openai_message(message: dict) -> dict:
             if image_part is not None:
                 parts.append(image_part)
         if not parts:
-            return {"role": role, "content": ""}
-        if len(parts) == 1 and parts[0]["type"] == "text":
-            return {"role": role, "content": parts[0]["text"]}
-        return {"role": role, "content": parts}
-    if isinstance(content, str):
-        return {"role": role, "content": content}
-    return {"role": role, "content": str(content or "")}
+            normalized = {"role": role, "content": ""}
+        elif len(parts) == 1 and parts[0]["type"] == "text":
+            normalized = {"role": role, "content": parts[0]["text"]}
+        else:
+            normalized = {"role": role, "content": parts}
+    elif isinstance(content, str):
+        normalized = {"role": role, "content": content}
+    else:
+        normalized = {"role": role, "content": str(content or "")}
+    if role == "tool":
+        tool_call_id = message.get("tool_call_id")
+        if tool_call_id not in (None, ""):
+            normalized["tool_call_id"] = str(tool_call_id)
+        name = message.get("name")
+        if name:
+            normalized["name"] = str(name)
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        normalized["tool_calls"] = [_normalize_openai_tool_call(tc) for tc in tool_calls if isinstance(tc, dict)]
+    if preserve_reasoning_content:
+        reasoning = message.get("reasoning_content")
+        if not (isinstance(reasoning, str) and reasoning.strip()):
+            reasoning = message.get("reasoning")
+        if isinstance(reasoning, str) and reasoning.strip():
+            normalized["reasoning_content"] = reasoning
+    return normalized
+
+
+def _parse_chat_template_kwargs(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _preserve_thinking_requested(chat_template_kwargs: object) -> bool:
+    value = _parse_chat_template_kwargs(chat_template_kwargs).get("preserve_thinking")
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().casefold() in {"true", "1", "yes", "on"}
+
+
+def _model_preserve_thinking_enabled(model_entry, args) -> bool:
+    if model_entry is None:
+        return False
+    try:
+        if _model_backend(model_entry) != "llama.cpp":
+            return False
+    except Exception:
+        return False
+    try:
+        defaults = resolve_llama_server_defaults(args)
+        effective = _effective_llama_server_options(model_entry, defaults)
+    except Exception:
+        return False
+    return _preserve_thinking_requested(effective.get("chat_template_kwargs"))
 
 
 def _messages_include_images(messages: list[dict]) -> bool:
@@ -14765,6 +15738,184 @@ def resolve_catalog_model_name(raw_name: str, catalog: list[ManagedModel]) -> st
     return name
 
 
+_GPU_ROUTE_VARIANT_RE = re.compile(r"^(?P<base>.+)__gpu(?P<gpu>\d+)$")
+
+
+def split_gpu_route_variant(route_id: str) -> tuple[str | None, int]:
+    """Local fallback; rebound to ``cli.replica``'s canonical helper below."""
+    match = _GPU_ROUTE_VARIANT_RE.match(str(route_id or ""))
+    if not match:
+        return None, -1
+    return str(match.group("base")), int(match.group("gpu"))
+
+
+def _split_gpu_route_variant(route_id: str) -> tuple[str | None, int]:
+    return split_gpu_route_variant(route_id)
+
+
+def gpr_variants(
+    model: ManagedModel,
+    catalog: list[ManagedModel],
+    total_gpus: int,
+) -> list[tuple[str, list[int]]]:
+    """``gpu_route_variants`` without the cards the base route already owns."""
+    owned = {
+        int(g)
+        for g in (cached_model_gpu_sets(catalog or [], total_gpus).get(model.model_id) or [])
+    }
+    return [
+        (route_id, gpu_set)
+        for route_id, gpu_set in gpu_route_variants(model, total_gpus)
+        if not owned.intersection(gpu_set)
+    ]
+
+
+def live_gpu_variants(host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> dict[str, list[dict]]:
+    """Per-card routes llama-swap currently publishes, grouped by base model.
+
+    Read from the swap's ``/v1/models`` instead of from config.yaml: only a route
+    llama-swap answers for is a route a request can be forwarded to.
+    """
+    grouped: dict[str, list[dict]] = {}
+    for route_id in get_published_model_ids(host, port):
+        base_id, gpu = _split_gpu_route_variant(route_id)
+        if base_id is None:
+            continue
+        grouped.setdefault(base_id, []).append({"id": str(route_id), "gpu": gpu})
+    for variants in grouped.values():
+        variants.sort(key=lambda entry: entry["gpu"])
+    return grouped
+
+
+def _already_loaded_route(
+    base_id: str,
+    published: set[str],
+    host=DEFAULT_PUBLIC_HOST,
+    port=DEFAULT_PUBLIC_PORT,
+) -> tuple[str, str]:
+    """Which live route must answer a request whose model is already running.
+
+    Every route of a model loads the same weights, so "a process is live" is not
+    "the base route is live": forwarding to the base while only
+    ``<model_id>__gpu1`` runs makes llama-swap load a second copy of the same
+    model on the pinned card. Only ids llama-swap reports as both published and
+    loaded are eligible, and a lookup that is unavailable or fails keeps the
+    answer the base route already had.
+    """
+    try:
+        live = get_loaded_model_ids(host, port)
+        live_variants = sorted(
+            live.intersection(published),
+            key=lambda route_id: _split_gpu_route_variant(route_id)[1],
+        )
+        if base_id in live:
+            live_routes = [base_id, *live_variants]
+        elif live_variants:
+            live_routes = list(live_variants)
+        else:
+            return base_id, "already_loaded"
+    except Exception as exc:
+        log_api_event(
+            "route_live_lookup_failed",
+            {"model": base_id, "error": repr(exc)[:200]},
+        )
+        return base_id, "already_loaded"
+    if len(live_routes) > 1:
+        # Two resident copies of one model is the OOM this switch exists to avoid,
+        # so the resolver reports it instead of silently choosing between them.
+        log_api_event(
+            "route_multiple_live_routes",
+            {"model": base_id, "routes": live_routes},
+        )
+    route_id = live_routes[0]
+    if route_id == base_id:
+        return base_id, "already_loaded"
+    return route_id, "already_loaded_variant"
+
+
+def select_model_route(
+    model_name: str,
+    catalog: list[ManagedModel],
+    config_path: Path | None = None,
+    host=DEFAULT_PUBLIC_HOST,
+    port=DEFAULT_PUBLIC_PORT,
+    *,
+    allow_variant: bool = False,
+) -> tuple[str, str]:
+    """Which published route a request for ``model_name`` must actually load.
+
+    Returns ``(route_id, reason)``. The base ``<model_id>`` unless its
+    statically pinned card cannot host it while another card can, in which case
+    the already-published ``<model_id>__gpuN`` route for that card wins. A model
+    that is already running keeps whichever of its routes is live, so a resident
+    ``__gpuN`` copy is reused instead of a second one being loaded beside it.
+    Anything else - unknown model, replica id, no published variant, no free card -
+    keeps the base id and leaves the load decision to the caller's admission gate.
+
+    Read-only, and ``config_path`` is deliberately never read here: routing reads
+    live state, and any file rewrite to move a model would cost every loaded
+    model its KV cache. Never raises; the fallback is the base route, which is
+    what would have been used without this function.
+    """
+    base_id = str(model_name or "")
+    try:
+        if not base_id or not allow_variant or is_replica_model_id(base_id):
+            return base_id, "static"
+        catalog = list(catalog or [])
+        model = next((item for item in catalog if item.model_id == base_id), None)
+        if model is None:
+            return base_id, "static"
+        total_gpus = detect_cuda_device_count()
+        variants = gpr_variants(model, catalog, total_gpus)
+        if not variants:
+            return base_id, "static"
+        published = {
+            entry["id"]
+            for entry in live_gpu_variants(host, port).get(base_id, ())
+        }
+        if not published.intersection(route_id for route_id, _gpu_set in variants):
+            return base_id, "static"
+        if get_catalog_model_process(base_id, catalog) is not None:
+            return _already_loaded_route(base_id, published, host, port)
+        pinned = [
+            int(gpu)
+            for gpu in (cached_model_gpu_sets(catalog, total_gpus).get(base_id) or [])
+        ]
+        if not pinned:
+            return base_id, "static"
+        occupants = _gpu_occupants(base_id, catalog)
+
+        def _fits(gpu_set: list[int]) -> bool:
+            fits, _info = model_has_enough_free_vram_to_load(model, gpu_set=gpu_set)
+            return bool(fits)
+
+        if not occupants.get(pinned[0]) or _fits(pinned):
+            return base_id, "pinned_free"
+        for route_id, gpu_set in variants:
+            if route_id not in published or occupants.get(gpu_set[0]):
+                continue
+            if not _fits(gpu_set):
+                continue
+            log_api_event(
+                "route_variant_selected",
+                {
+                    "model": base_id,
+                    "route": route_id,
+                    "gpu": gpu_set[0],
+                    "pinned": pinned,
+                    "pinned_occupants": [entry[0] for entry in occupants.get(pinned[0], ())],
+                },
+            )
+            return route_id, f"variant_gpu{gpu_set[0]}"
+        return base_id, "pinned_busy"
+    except Exception as exc:
+        log_api_event(
+            "route_variant_resolver_failed",
+            {"model": base_id, "error": repr(exc)[:200]},
+        )
+        return base_id, "static"
+
+
 def _proxy_request_to_public_api(method: str, path: str, *, body: bytes | None = None, headers: dict[str, str] | None = None, host: str = DEFAULT_PUBLIC_HOST, port: int = DEFAULT_PUBLIC_PORT):
     url = f"http://{host}:{port}{path}"
     proxy_headers = {}
@@ -15159,7 +16310,20 @@ def start_unexpected_unload_guard(args):
                             host,
                             port,
                         )
-                        if _touch_model_via_llamaswap(model_id, host, port):
+                        # Resolved the way a request resolves it: a __gpuN route holds
+                        # the same weights as its base, so reissuing the base id after an
+                        # unexpected unload starts a second copy beside the one that is
+                        # still live. With nothing resident the resolver returns the base
+                        # route, which is what this used to ask for unconditionally.
+                        keepalive_route_id, _keepalive_reason = select_model_route(
+                            model_id,
+                            catalog,
+                            getattr(args, "config", None),
+                            host,
+                            port,
+                            allow_variant=True,
+                        )
+                        if _touch_model_via_llamaswap(keepalive_route_id, host, port):
                             state["loaded"] = get_loaded_catalog_model_ids(catalog)
                             log_model_runtime_snapshot(
                                 "model_unexpected_unload_runtime_after_reload",
@@ -15409,6 +16573,7 @@ def sync_replica_runtime_state(
     global_replica_config: dict[str, object] | None = None,
 ) -> None:
     port_by_model = get_config_model_port_map(config_path)
+    route_index = _llamaswap_route_index(config_path)
     model_by_port = {port: model_id for model_id, port in port_by_model.items()}
     total_gpus = detect_cuda_device_count()
     processes = get_llama_server_processes()
@@ -15416,7 +16581,23 @@ def sync_replica_runtime_state(
     gpu_mem_by_pid = get_gpu_process_memory_by_pid()
     now = time.monotonic()
     with REPLICA_ROUTER_STATE.lock:
+        REPLICA_ROUTER_STATE.base_pid = {}
         for model in catalog:
+            base_ports = {
+                int(info["port"])
+                for info in route_index.values()
+                if info.get("base_model") == model.model_id and not info.get("is_replica")
+            }
+            if not base_ports:
+                base_port = port_by_model.get(model.model_id)
+                if base_port is not None:
+                    base_ports = {int(base_port)}
+            exact_port = port_by_model.get(model.model_id)
+            if exact_port in proc_by_port:
+                base_proc = proc_by_port[exact_port]
+            else:
+                base_proc = next((proc_by_port[port] for port in base_ports if port in proc_by_port), None)
+            REPLICA_ROUTER_STATE.base_pid[model.model_id] = int(base_proc["pid"]) if base_proc else 0
             cfg = get_model_replica_config(model, global_replica_config, total_gpus=total_gpus)
             if not cfg.enabled:
                 continue
@@ -15847,11 +17028,16 @@ def start_ctx_metadata_server(args):
             if parsed.path == "/api/tags":
                 published_models = get_published_model_ids(client_host, int(args.public_port))
                 processes = get_llama_server_processes()
-                process_by_model = {proc["model_path"]: proc for proc in processes}
                 gpu_process_map = get_gpu_process_map()
                 models = []
                 for model in catalog:
-                    process = process_by_model.get(_safe_realpath(model.local_path))
+                    process = get_catalog_model_process(
+                        model.model_id,
+                        catalog,
+                        config_path=getattr(args, "config", None),
+                        processes=processes,
+                        allow_replica_fallback=True,
+                    )
                     loaded = process is not None and model.model_id in published_models
                     models.append(build_ollama_model_payload(model, loaded=loaded, process=process, gpu_process_map=gpu_process_map, capabilities=model_runtime_capabilities(model.model_id, getattr(args, "config", None), get_loaded_model_ids(client_host, int(args.public_port)))))
                 self._send_json({"models": models})
@@ -15859,11 +17045,16 @@ def start_ctx_metadata_server(args):
             if parsed.path == "/api/ps":
                 published_models = get_published_model_ids(client_host, int(args.public_port))
                 processes = get_llama_server_processes()
-                process_by_model = {proc["model_path"]: proc for proc in processes}
                 gpu_process_map = get_gpu_process_map()
                 running = []
                 for model in catalog:
-                    process = process_by_model.get(_safe_realpath(model.local_path))
+                    process = get_catalog_model_process(
+                        model.model_id,
+                        catalog,
+                        config_path=getattr(args, "config", None),
+                        processes=processes,
+                        allow_replica_fallback=True,
+                    )
                     if process is None or model.model_id not in published_models:
                         continue
                     running.append(build_ollama_model_payload(model, loaded=True, process=process, gpu_process_map=gpu_process_map, capabilities=model_runtime_capabilities(model.model_id, getattr(args, "config", None), get_loaded_model_ids(client_host, int(args.public_port)))))
@@ -16051,13 +17242,38 @@ def start_ctx_metadata_server(args):
                                     public_host=client_host,
                                     public_port=int(args.public_port),
                                 )
-                                if not is_replica_request and model_entry is not None:
-                                    if self._reject_if_gpu_busy(activity_model, catalog, api_style="openai"):
-                                        return
+                                route_on_variant = False
                                 if upstream_model_name:
                                     if is_replica_request:
                                         proxy_payload["model"] = upstream_model_name
                                         body = json.dumps(proxy_payload).encode("utf-8")
+                                    else:
+                                        # A __gpuN id is not a catalog model_id, so it
+                                        # may only reach the forwarded payload. Resolved
+                                        # before the admission gate: a published variant on
+                                        # a free card is a load that needs no admission,
+                                        # and asking the gate first lets it retire the
+                                        # occupant of the pinned card to satisfy a pin
+                                        # that a free card already made unnecessary.
+                                        route_id, _route_reason = select_model_route(
+                                            upstream_model_name,
+                                            catalog,
+                                            args.config,
+                                            client_host,
+                                            int(args.public_port),
+                                            allow_variant=True,
+                                        )
+                                        if route_id != upstream_model_name:
+                                            route_on_variant = True
+                                            proxy_payload["model"] = route_id
+                                            body = json.dumps(proxy_payload).encode("utf-8")
+                                    if (
+                                        not route_on_variant
+                                        and not is_replica_request
+                                        and model_entry is not None
+                                    ):
+                                        if self._reject_if_gpu_busy(activity_model, catalog, api_style="openai"):
+                                            return
                                     REPLICA_ROUTER_STATE.request_started(upstream_model_name)
                 except Exception:
                     pass
@@ -16316,7 +17532,7 @@ def start_ctx_metadata_server(args):
                 else:
                     self._send_json({"error": message, "code": "model_loading"}, status=503)
                 return True
-            target_loaded = get_catalog_model_process(model_name, catalog) is not None
+            target_loaded = get_catalog_model_process(model_name, catalog, allow_replica_fallback=True) is not None
             if (not target_loaded) and request_looks_like_model_probe(payload or {}):
                 probe_cfg = _resolve_model_probe_autoload_config()
                 if not bool(probe_cfg.get("enabled")):
@@ -16376,6 +17592,17 @@ def start_ctx_metadata_server(args):
                 model_name, catalog, client_host, int(args.public_port), args.config
             )
             if not gpu_conflict:
+                return False
+            # A card this load needs is often held by a route that exists only to park a
+            # spare copy of another model. Sacrifice that one rather than the base route
+            # that may be serving traffic; returning False falls through to the 503 below.
+            if evict_disposable_route_for_load(
+                model_name,
+                catalog,
+                plan.pinned or effective_model_gpu_set(model_name, catalog),
+                client_host=client_host,
+                public_port=int(args.public_port),
+            ):
                 return False
             log_api_event("model_load_blocked_gpu_busy", {"model": model_name, "message": gpu_conflict, "api_style": api_style})
             # A refusal is the only durable signal that this model needs the card an
@@ -16601,12 +17828,31 @@ def start_ctx_metadata_server(args):
                     return
             if self._reject_if_model_loading(upstream_model_name, catalog, is_replica=is_replica_request, api_style="ollama"):
                 return
-            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
+            # Resolved before the admission gate for the same reason as the OpenAI
+            # proxy path: a published variant on a free card needs no admission, and
+            # asking the gate first lets it retire the pinned card's occupant for a
+            # load that a free card already made unnecessary.
+            upstream_route_id = upstream_model_name
+            route_on_variant = False
+            if not is_replica_request and upstream_model_name:
+                upstream_route_id, _route_reason = select_model_route(
+                    upstream_model_name,
+                    catalog,
+                    args.config,
+                    client_host,
+                    int(args.public_port),
+                    allow_variant=True,
+                )
+                route_on_variant = upstream_route_id != upstream_model_name
+            if (not is_replica_request) and not route_on_variant and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
             _blocked, _spill = self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name, affinity_key=affinity_key)
             if _spill is not None:
                 upstream_model_name = _spill
                 is_replica_request = is_replica_model_id(upstream_model_name)
+                # The spilled route is a different model: its variant decision is void.
+                upstream_route_id = upstream_model_name
+                route_on_variant = False
             if _blocked:
                 return
             if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
@@ -16641,7 +17887,7 @@ def start_ctx_metadata_server(args):
                 return
             stream = bool(payload.get("stream"))
             upstream_payload = {
-                "model": upstream_model_name,
+                "model": upstream_route_id,
                 "messages": messages,
                 "stream": stream,
             }
@@ -16921,13 +18167,28 @@ def start_ctx_metadata_server(args):
             if self._reject_if_model_loading(upstream_model_name, catalog, is_replica=is_replica_request, api_style="openai"):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
-            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
+            upstream_route_id = upstream_model_name
+            route_on_variant = False
+            if (not is_replica_request) and upstream_model_name:
+                upstream_route_id, _route_reason = select_model_route(
+                    upstream_model_name,
+                    catalog,
+                    args.config,
+                    client_host,
+                    int(args.public_port),
+                    allow_variant=True,
+                )
+                route_on_variant = upstream_route_id != upstream_model_name
+            if (not is_replica_request) and not route_on_variant and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
             _blocked, _spill = self._reject_if_concurrent_limit_exceeded(model_name, api_style="openai", upstream_model_name=upstream_model_name, affinity_key=affinity_key)
             if _spill is not None:
                 upstream_model_name = _spill
                 is_replica_request = is_replica_model_id(upstream_model_name)
+                # The spilled route is a different model: its variant decision is void.
+                upstream_route_id = upstream_model_name
+                route_on_variant = False
             if _blocked:
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
@@ -17064,7 +18325,26 @@ def start_ctx_metadata_server(args):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 self._send_json({"error": {"message": "messages is required", "type": "invalid_request_error"}}, status=400)
                 return
-            messages = [_normalize_openai_message(item) for item in raw_messages if isinstance(item, dict)]
+            preserve_reasoning_content = _model_preserve_thinking_enabled(model_entry, args)
+            messages = [
+                _normalize_openai_message(item, preserve_reasoning_content=preserve_reasoning_content)
+                for item in raw_messages if isinstance(item, dict)
+            ]
+            if preserve_reasoning_content:
+                forwarded_reasoning = sum(
+                    1 for item in messages
+                    if isinstance(item.get("reasoning_content"), str) and item.get("reasoning_content").strip()
+                )
+                if forwarded_reasoning:
+                    log_api_event(
+                        "openai_chat_reasoning_content_forwarded",
+                        {
+                            "request_id": request_id,
+                            "model": model_name,
+                            "upstream_model": upstream_model_name,
+                            "messages_with_reasoning": forwarded_reasoning,
+                        },
+                    )
             if bool(resolve_chat_tool_continue_repair_config(args).get("enabled")):
                 messages = _sanitize_chat_tool_repair_notices_in_messages(messages)
             normalized_system_messages = _normalize_system_messages_for_llamacpp(messages)
@@ -17131,7 +18411,7 @@ def start_ctx_metadata_server(args):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
             upstream_payload = dict(payload)
-            upstream_payload["model"] = upstream_model_name
+            upstream_payload["model"] = upstream_route_id
             upstream_payload["messages"] = messages
             upstream_payload.setdefault("cache_prompt", True)
             # OpenAI-compatible clients use both spellings. llama.cpp uses
@@ -17500,6 +18780,7 @@ def start_ctx_metadata_server(args):
                     log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": len(final_content), "reasoning_len": final_reasoning_len, "tool_call_chunks": final_tool_call_chunks, "finish_reason": final_stream_state.get("finish_reason") or "", "reasoning_only_final": reasoning_only_final, "repair_rounds": stream_repair_round_used, "router_state": replica_trace_state_for_base(model_name)})
                     _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, content=final_content, reasoning_len=final_reasoning_len, tool_calls=final_stream_state.get("tool_calls"), tool_call_chunks=final_tool_call_chunks, finish_reason=final_stream_state.get("finish_reason") or "", repair_rounds=stream_repair_round_used)
                     if final_tool_call_chunks == 0:
+                        _capture_tool_intent_failure(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, payload=upstream_payload, response={"content": final_content, "reasoning_len": final_reasoning_len, "tool_call_chunks": final_tool_call_chunks, "finish_reason": final_stream_state.get("finish_reason") or "", "repair_rounds": stream_repair_round_used})
                         _log_chat_stop_without_tools(request_id, model_name, upstream_model_name, stream=True, content=final_content, reasoning_len=final_reasoning_len, finish_reason=final_stream_state.get("finish_reason") or "", repair_rounds=stream_repair_round_used)
                     if reasoning_only_final:
                         log_api_event("openai_chat_reasoning_only_final", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "reasoning_len": final_reasoning_len, "finish_reason": final_stream_state.get("finish_reason") or ""})
@@ -17633,6 +18914,7 @@ def start_ctx_metadata_server(args):
                     log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": stream_visible_content_len, "reasoning_len": stream_reasoning_len, "tool_call_chunks": stream_tool_call_chunks, "finish_reason": stream_finish_reason, "reasoning_only_final": reasoning_only_final, "router_state": replica_trace_state_for_base(model_name)})
                     _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, content="".join(stream_visible_content_parts), reasoning_len=stream_reasoning_len, tool_calls=[{}] * stream_tool_call_chunks if stream_tool_call_chunks > 0 else [], tool_call_chunks=stream_tool_call_chunks, finish_reason=stream_finish_reason, repair_rounds=stream_repair_round_used)
                     if stream_tool_call_chunks == 0:
+                        _capture_tool_intent_failure(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, payload=upstream_payload, response={"content": "".join(stream_visible_content_parts), "reasoning_len": stream_reasoning_len, "tool_call_chunks": stream_tool_call_chunks, "finish_reason": stream_finish_reason, "repair_rounds": stream_repair_round_used})
                         _log_chat_stop_without_tools(request_id, model_name, upstream_model_name, stream=True, content="".join(stream_visible_content_parts), reasoning_len=stream_reasoning_len, finish_reason=stream_finish_reason, repair_rounds=stream_repair_round_used)
                     if reasoning_only_final:
                         log_api_event("openai_chat_reasoning_only_final", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "reasoning_len": stream_reasoning_len, "finish_reason": stream_finish_reason})
@@ -17740,6 +19022,7 @@ def start_ctx_metadata_server(args):
             log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": False, "visible_content_len": len(nonstream_content), "reasoning_len": len(nonstream_reasoning), "tool_calls_count": len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), "finish_reason": choice.get("finish_reason") or "", "reasoning_only_final": nonstream_reasoning_only, "router_state": replica_trace_state_for_base(model_name)})
             _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=False, content=nonstream_content, reasoning=nonstream_reasoning, tool_calls=nonstream_tool_calls, tool_call_chunks=len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), finish_reason=choice.get("finish_reason") or "", repair_rounds=repair_rounds_used)
             if not nonstream_tool_calls:
+                _capture_tool_intent_failure(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=False, payload=upstream_payload, response={"content": nonstream_content, "reasoning": nonstream_reasoning, "finish_reason": choice.get("finish_reason") or "", "repair_rounds": repair_rounds_used})
                 _log_chat_stop_without_tools(request_id, model_name, upstream_model_name, stream=False, content=nonstream_content, reasoning_len=len(nonstream_reasoning), finish_reason=choice.get("finish_reason") or "", repair_rounds=repair_rounds_used)
             if nonstream_reasoning_only:
                 log_api_event("openai_chat_reasoning_only_final", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "reasoning_len": len(nonstream_reasoning), "finish_reason": choice.get("finish_reason") or ""})
@@ -17884,12 +19167,27 @@ def start_ctx_metadata_server(args):
                     return
             if self._reject_if_model_loading(upstream_model_name, catalog, is_replica=is_replica_request, api_style="openai"):
                 return
-            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
+            upstream_route_id = upstream_model_name
+            route_on_variant = False
+            if (not is_replica_request) and upstream_model_name:
+                upstream_route_id, _route_reason = select_model_route(
+                    upstream_model_name,
+                    catalog,
+                    args.config,
+                    client_host,
+                    int(args.public_port),
+                    allow_variant=True,
+                )
+                route_on_variant = upstream_route_id != upstream_model_name
+            if (not is_replica_request) and not route_on_variant and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 return
             _blocked, _spill = self._reject_if_concurrent_limit_exceeded(model_name, api_style="openai", upstream_model_name=upstream_model_name, affinity_key=affinity_key)
             if _spill is not None:
                 upstream_model_name = _spill
                 is_replica_request = is_replica_model_id(upstream_model_name)
+                # The spilled route is a different model: its variant decision is void.
+                upstream_route_id = upstream_model_name
+                route_on_variant = False
             if _blocked:
                 return
             mark_model_activity(model_name, f"openai_responses:{request_id}", "request_start")
@@ -17912,7 +19210,7 @@ def start_ctx_metadata_server(args):
             # computer_use_preview. Raw passthrough is opt-in for future
             # backends that are known to implement modern Responses safely.
             if _responses_raw_passthrough_enabled():
-                _passthrough_payload = {**payload, "model": upstream_model_name}
+                _passthrough_payload = {**payload, "model": upstream_route_id}
                 try:
                     # Use explicit CLI flag if provided, otherwise fall back to server config
                     flatten_enabled = True
@@ -17999,7 +19297,7 @@ def start_ctx_metadata_server(args):
             allow_tool_output_images = bool(model_entry and _has_configured_mmproj_runtime(model_entry))
             upstream_payload = _responses_payload_to_chat_payload(
                 payload,
-                upstream_model_name,
+                upstream_route_id,
                 flatten_namespace_tools=flatten_namespace_tools,
                 tool_registry=tool_registry,
                 allow_tool_output_images=allow_tool_output_images,
@@ -18165,7 +19463,7 @@ def start_ctx_metadata_server(args):
                 while True:
                     internal_payload = _responses_payload_to_chat_payload(
                         payload,
-                        upstream_model_name,
+                        upstream_route_id,
                         flatten_namespace_tools=flatten_namespace_tools,
                         tool_registry=tool_registry,
                         extra_messages=extra_messages,
@@ -19374,12 +20672,27 @@ def start_ctx_metadata_server(args):
                     return
             if self._reject_if_model_loading(upstream_model_name, catalog, is_replica=is_replica_request, api_style="ollama"):
                 return
-            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
+            upstream_route_id = upstream_model_name
+            route_on_variant = False
+            if (not is_replica_request) and upstream_model_name:
+                upstream_route_id, _route_reason = select_model_route(
+                    upstream_model_name,
+                    catalog,
+                    args.config,
+                    client_host,
+                    int(args.public_port),
+                    allow_variant=True,
+                )
+                route_on_variant = upstream_route_id != upstream_model_name
+            if (not is_replica_request) and not route_on_variant and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
             _blocked, _spill = self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name, affinity_key=affinity_key)
             if _spill is not None:
                 upstream_model_name = _spill
                 is_replica_request = is_replica_model_id(upstream_model_name)
+                # The spilled route is a different model: its variant decision is void.
+                upstream_route_id = upstream_model_name
+                route_on_variant = False
             if _blocked:
                 return
             if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
@@ -19410,7 +20723,7 @@ def start_ctx_metadata_server(args):
                 )
                 return
             upstream_payload = {
-                "model": upstream_model_name,
+                "model": upstream_route_id,
                 "messages": upstream_messages,
                 "stream": False,
             }
@@ -19590,18 +20903,33 @@ def start_ctx_metadata_server(args):
                 )
             if self._reject_if_model_loading(upstream_model_name, catalog, is_replica=is_replica_request, api_style="ollama"):
                 return
-            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
+            upstream_route_id = upstream_model_name
+            route_on_variant = False
+            if (not is_replica_request) and upstream_model_name:
+                upstream_route_id, _route_reason = select_model_route(
+                    upstream_model_name,
+                    catalog,
+                    args.config,
+                    client_host,
+                    int(args.public_port),
+                    allow_variant=True,
+                )
+                route_on_variant = upstream_route_id != upstream_model_name
+            if (not is_replica_request) and not route_on_variant and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
             _blocked, _spill = self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name, affinity_key=affinity_key)
             if _spill is not None:
                 upstream_model_name = _spill
                 is_replica_request = is_replica_model_id(upstream_model_name)
+                # The spilled route is a different model: its variant decision is void.
+                upstream_route_id = upstream_model_name
+                route_on_variant = False
             if _blocked:
                 return
             if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
                 REPLICA_ROUTER_STATE.request_started(upstream_model_name)
             mark_model_activity(model_name, "ollama_embeddings", "request_start")
-            upstream_payload = {"model": upstream_model_name, "input": text_input}
+            upstream_payload = {"model": upstream_route_id, "input": text_input}
             try:
                 response = _proxy_request_to_public_api(
                     "POST",
@@ -19811,7 +21139,7 @@ def list_models(args):
             _show_local_catalog_fallback(args, e)
             return 0
 
-    output = render_models_table(load_catalog(args.catalog, _args_server_config_path(args)), args.public_host, args.public_port, get_effective_idle_ttl(args))
+    output = render_models_table(load_catalog(args.catalog, _args_server_config_path(args)), args.public_host, args.public_port, get_effective_idle_ttl(args), getattr(args, "config", None))
     if output:
         print("\n" + output)
     else:
@@ -23448,9 +24776,11 @@ try:
         resolve_global_replica_config as _sc_resolve_global,
         drop_internal_route_from_llamaswap_config as _sc_drop_internal_route,
         route_carries_mmproj as _sc_route_carries_mmproj,
+        split_gpu_route_variant as _sc_split_gpu_variant,
         set_instance_mmproj_in_llamaswap_config as _sc_set_instance_mmproj,
         cached_model_gpu_sets as _sc_cached_model_gpu_sets,
         reserved_base_gpus as _sc_reserved_base_gpus,
+        gpu_route_variants as _sc_gpu_route_variants,
         _replica_gpu_sets as _sc_replica_gpu_sets,
         _infer_base_gpu_count as _sc_infer_base_gpu_count,
         iter_catalog_base_models as _sc_iter_base_models,
@@ -23463,11 +24793,13 @@ try:
     ensure_replica_route = _sc_ensure  # type: ignore
     cached_model_gpu_sets = _sc_cached_model_gpu_sets  # type: ignore
     reserved_base_gpus = _sc_reserved_base_gpus  # type: ignore
+    gpu_route_variants = _sc_gpu_route_variants  # type: ignore
     _replica_gpu_sets = _sc_replica_gpu_sets  # type: ignore
     _infer_base_gpu_count = _sc_infer_base_gpu_count  # type: ignore
     iter_catalog_base_models = _sc_iter_base_models  # type: ignore
     summarize_configured_replicas = _sc_summarize_replicas  # type: ignore
     get_model_replica_config = _sc_get_replica  # type: ignore
+
     is_replica_model_id = _sc_is_replica  # type: ignore
     iter_catalog_with_replicas = _sc_iter_replica  # type: ignore
     replica_base_model_id = _sc_base_id  # type: ignore
@@ -23477,6 +24809,7 @@ try:
     route_carries_mmproj = _sc_route_carries_mmproj  # type: ignore
     set_instance_mmproj_in_llamaswap_config = _sc_set_instance_mmproj  # type: ignore
     drop_internal_route_from_llamaswap_config = _sc_drop_internal_route  # type: ignore
+    split_gpu_route_variant = _sc_split_gpu_variant  # type: ignore
 except Exception:
     pass
 try:
