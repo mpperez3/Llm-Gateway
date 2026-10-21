@@ -663,6 +663,20 @@ class SelectReplicaGuardsTest(unittest.TestCase, _RouterStateMixin):
         self.assertEqual((selected, is_replica), (REPLICA_ID, True))
         self.assertIn("affinity_spillover_saturated", self._event_names())
 
+    def test_a_single_request_saturates_a_parallel_one_base(self):
+        _ready_replica(self.state, status="ready", last_used=0.0)
+        payload = {"messages": [{"role": "user", "content": "parallel-one"}]}
+        self._bind_base("parallel-one", payload)
+        self.state.base_in_flight[BASE_ID] = 1
+        self.state.base_busy_since[BASE_ID] = self.now - 31.0
+        with (
+            self._spillover_enabled(),
+            mock.patch.object(_cli_impl, "_target_capacity", return_value=1),
+        ):
+            selected, _key, is_replica = self._select("parallel-one", payload)
+        self.assertEqual((selected, is_replica), (REPLICA_ID, True))
+        self.assertIn("affinity_spillover_saturated", self._event_names())
+
     def test_a_saturated_base_does_not_spill_before_the_threshold(self):
         _ready_replica(self.state, status="ready", last_used=0.0)
         payload = {"messages": [{"role": "user", "content": "spill-early"}]}
@@ -767,6 +781,29 @@ class SelectReplicaGuardsTest(unittest.TestCase, _RouterStateMixin):
 # --------------------------------------------------------------------------- #
 # health truthfulness: a route record is not a live process
 # --------------------------------------------------------------------------- #
+class TargetCapacityTest(unittest.TestCase):
+    def test_reads_parallel_from_the_rendered_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                yaml.safe_dump(
+                    {
+                        "startPort": 18000,
+                        "models": {
+                            BASE_ID: {"cmd": "llama-server --parallel 1"},
+                            "wide": {"cmd": "llama-server --parallel 4"},
+                            "defaulted": {"cmd": "llama-server"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(_cli_impl._target_capacity(BASE_ID, config), 1)
+            self.assertEqual(_cli_impl._target_capacity("wide", config), 4)
+            self.assertEqual(_cli_impl._target_capacity("defaulted", config), 1)
+            self.assertEqual(_cli_impl._target_capacity("missing", config), 1)
+
+
 class BaseBusyWindowTest(unittest.TestCase, _RouterStateMixin):
     def setUp(self):
         self.reset_router_state()
@@ -812,6 +849,16 @@ class RouterHealthTruthfulnessTest(unittest.TestCase, _RouterStateMixin):
 
     def test_a_ready_record_without_process_telemetry_stays_ready(self):
         self.assertIs(self._record("ready", pid=None).state, TargetState.READY)
+
+    def test_health_capacity_comes_from_the_route_parallel(self):
+        with mock.patch.object(_cli_impl, "_target_capacity", return_value=1):
+            health = self.state.health_of(BASE_ID)
+        self.assertEqual(health.capacity, 1)
+        self.assertFalse(health.saturated)
+        self.state.base_in_flight[BASE_ID] = 1
+        with mock.patch.object(_cli_impl, "_target_capacity", return_value=1):
+            health = self.state.health_of(BASE_ID)
+        self.assertTrue(health.saturated)
 
 
 # --------------------------------------------------------------------------- #

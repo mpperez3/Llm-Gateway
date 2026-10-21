@@ -1242,11 +1242,33 @@ def _dedup_should_bypass(args=None) -> str | None:
 
 
 def _replica_target_capacity() -> int:
-    """How many requests one upstream may serve at once (``--parallel``)."""
+    """Global admission limit for concurrent requests, not a route's real capacity."""
     try:
         return max(1, int(DEFAULT_MAX_CONCURRENT_PER_MODEL))
     except Exception:
         return 1
+
+
+def _target_capacity(target_id: str, config_path: Path | str | None = None) -> int:
+    """Parallel slots declared by the target's rendered route.
+
+    ``--parallel`` is how many requests llama-server can actually serve at once;
+    the global concurrent-request limit is an admission policy, not target
+    capacity. Fall back to 1 (llama-server's default) when the route is unknown.
+    """
+    try:
+        cmd = _llamaswap_route_commands(
+            Path(config_path) if config_path is not None else Path(DEFAULT_CONFIG_PATH)
+        ).get(str(target_id), "")
+    except Exception:
+        cmd = ""
+    match = re.search(r"--parallel\s+(\d+)", cmd or "")
+    if match:
+        try:
+            return max(1, int(match.group(1)))
+        except (TypeError, ValueError):
+            pass
+    return 1
 
 
 def _resolve_affinity_policy_config() -> object:
@@ -6014,7 +6036,7 @@ class ReplicaRouterState:
                     target=target,
                     state=_TargetState.COLD,
                     in_flight=in_flight,
-                    capacity=max(1, _replica_target_capacity()),
+                    capacity=_target_capacity(target),
                     confirmed_dead=False,
                     blacklist_until=0.0,
                 )
@@ -6029,7 +6051,7 @@ class ReplicaRouterState:
                     target=target,
                     state=state,
                     in_flight=in_flight,
-                    capacity=max(1, _replica_target_capacity()),
+                    capacity=_target_capacity(target),
                     confirmed_dead=state is _TargetState.DEAD,
                     blacklist_until=float(rec.blacklist_until or 0.0),
                 )
@@ -6048,7 +6070,7 @@ class ReplicaRouterState:
             port=snapshot[4],
             state=_TargetState.READY if snapshot[0] == "ready" else _TargetState.COLD,
             in_flight=snapshot[1],
-            capacity=max(1, _replica_target_capacity()),
+            capacity=_target_capacity(target),
             blacklist_until=snapshot[2],
             probe=probe,
             timeout_s=cfg.probe_timeout_s,
