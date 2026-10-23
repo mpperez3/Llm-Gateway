@@ -177,6 +177,7 @@ def update_llamacpp(layout, *, dry_run: bool = False, force: bool = False, **kwa
         build_llama_cpp_from_source,
         detect_nvidia_gpu,
         locate_nvcc,
+        locate_nvcc_for_python,
         write_manifest,
         _link_stable_binary,
         read_install_manifest,
@@ -240,9 +241,15 @@ def update_llamacpp(layout, *, dry_run: bool = False, force: bool = False, **kwa
     try:
         if force_source or strategy.startswith("source"):
             # rebuild from source tag
-            enable_cuda = detect_nvidia_gpu() and locate_nvcc() is not None
+            # A host with no system nvcc is not a host without CUDA: the toolkit may
+            # come from the Python packages, which is how this repo installs it.
+            enable_cuda = detect_nvidia_gpu() and (
+                locate_nvcc() is not None or locate_nvcc_for_python(sys.executable) is not None
+            )
             llama_server_real = build_llama_cpp_from_source(release, layout.install_root, enable_tls=False, dry_run=False, python_exec=sys.executable, enable_cuda=enable_cuda)
             _link_stable_binary(llama_server_real, layout.install_root / "llama-server", dry_run=False)
+            strategy = "source-build-cuda" if enable_cuda else "source-build"
+
         else:
             asset = choose_llamacpp_linux_asset(release)
             if asset is None:

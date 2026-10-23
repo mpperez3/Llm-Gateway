@@ -647,6 +647,54 @@ def start_replica_reaper(args, *, poll_s: float = 30.0, stop_event: threading.Ev
     return thread
 
 
+# ---------------------------------------------------------------------------
+# Idle-GPU warmer (opt-in)
+# ---------------------------------------------------------------------------
+
+
+def _idle_warmer_poll_seconds(args) -> float:
+    try:
+        from llamacpp_stack._cli_impl import idle_warmer_poll_seconds
+
+        return max(0.01, float(idle_warmer_poll_seconds(args)))  # type: ignore
+    except Exception:
+        return 30.0
+
+
+def start_idle_warmer(args, *, stop_event: threading.Event | None = None):
+    """Keep an idle GPU warm by loading an already-published route onto it.
+
+    Opt-in (``experimental.idle_gpu_warmer.enabled``, default off): a warm copy holds its
+    weights resident for as long as it is loaded, which is a real and permanent VRAM cost.
+    Like the reaper, the load is an ordinary request against llama-swap -- never a
+    ``config.yaml`` write, which would unload every resident model and destroy every KV
+    cache, the warm copy's included.
+
+    The switch is re-read every tick rather than latched at start, so an operator can turn
+    the warmer on or off without restarting the manager.
+    """
+
+    def loop():
+        while stop_event is None or not stop_event.is_set():
+            poll_s = _idle_warmer_poll_seconds(args)
+            try:
+                from llamacpp_stack._cli_impl import run_idle_warmer_tick
+
+                run_idle_warmer_tick(args)
+            except Exception as exc:
+                # One bad tick must not take the loop down: the next tick re-reads live
+                # occupancy and decides from scratch.
+                log_api_event("idle_warmer_error", {"error": str(exc)})
+            if stop_event is not None:
+                stop_event.wait(max(0.01, poll_s))
+            else:
+                time.sleep(max(0.01, poll_s))
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return thread
+
+
 def _prepare_manager_socket_path(socket_path: str) -> None:
     if not os.path.exists(socket_path):
         return
@@ -912,6 +960,7 @@ def daemon_mode(args):
     unload_guard_thread = guard_fn(args) if guard_fn is not None else None  # type: ignore
     auto_update_thread = start_catalog_auto_update_watch(args)
     reaper_thread = start_replica_reaper(args)
+    warmer_thread = start_idle_warmer(args)
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -1041,6 +1090,7 @@ __all__ = [  # type: ignore
     "sync_config_from_server_config_for_startup",
     "start_catalog_auto_update_watch",
     "start_replica_reaper",
+    "start_idle_warmer",
     "unload_replica_via_llamaswap",
     "_prepare_manager_socket_path",
     "read_install_manifest",

@@ -36,6 +36,10 @@ uv.lock
 tests/fixtures/gateway_raw_examples/
 **/gateway_raw_examples/
 
+# Hermes tool-intent fixtures — conversaciones reales con datos personales (no commitear)
+tests/fixtures/hermes_tool_intent/
+**/hermes_tool_intent/
+
 # Debug output logs
 debug_log*.txt
 *.debug.log

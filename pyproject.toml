@@ -32,3 +32,6 @@ packages = ["llamacpp_stack", "llamacpp_stack.bundle", "llamacpp_stack.cli"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "real_model: requires a real GGUF artifact (auto-downloaded tiny model, see tests/_real_test_model.py)",
+]

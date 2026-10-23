@@ -416,9 +416,10 @@ class RenderTest(unittest.TestCase, _ConfigEnvMixin):
         catalog = [self._model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})]
         data = self._render(catalog)
         self.assertEqual(
-            list(data["models"]),
+            [name for name in data["models"] if "__gpu" not in name],
             [BASE_ID],
-            "there must be no dedicated vision route",
+            "there must be no dedicated vision route; the extra published ids are "
+            "per-card GPU variants of the same route, not projector routes",
         )
         self.assertNotIn("--mmproj", data["models"][BASE_ID]["cmd"])
 
@@ -447,7 +448,10 @@ class RenderTest(unittest.TestCase, _ConfigEnvMixin):
         data = self._render([other, lazy])
         self.assertIn("--mmproj", data["models"]["q4-model"]["cmd"])
         self.assertNotIn("--mmproj", data["models"]["lazy-model"]["cmd"])
-        self.assertEqual(sorted(data["models"]), ["lazy-model", "q4-model"])
+        self.assertEqual(
+            sorted(name for name in data["models"] if "__gpu" not in name),
+            ["lazy-model", "q4-model"],
+        )
 
     def test_idle_ttl_is_used_for_the_base_route(self):
         self.use_conf()

@@ -15,6 +15,7 @@ import time as _time
 from dataclasses import replace
 from pathlib import Path
 
+from . import models as _models
 from .constants import DEFAULT_IDLE_TTL
 from .models import ManagedModel, ReplicaConfig
 from .vision import (
@@ -337,6 +338,10 @@ def get_model_replica_config(model: ManagedModel, global_raw: dict[str, object] 
     except Exception:
         pass
     try:
+        cfg.gpu_capacity_mib = max(0, int(raw.get("gpu_capacity_mib", cfg.gpu_capacity_mib)))
+    except Exception:
+        pass
+    try:
         cfg.max_models_per_gpu = max(1, int(raw.get("max_models_per_gpu", cfg.max_models_per_gpu)))
     except Exception:
         pass
@@ -374,6 +379,72 @@ def replica_base_model_id(model_id: str) -> str:
     return re.sub(r"__replica_\d+$", "", str(model_id or ""))
 
 
+_GPU_ROUTE_VARIANT_RE = re.compile(r"^(?P<base>.+)__gpu(?P<gpu>\d+)$")
+
+
+def split_gpu_route_variant(model_id: str) -> tuple[str | None, int]:
+    """``(base_model_id, gpu)`` for a ``__gpuN`` route id, ``(None, -1)`` otherwise."""
+    match = _GPU_ROUTE_VARIANT_RE.match(str(model_id or ""))
+    if not match:
+        return None, -1
+    return str(match.group("base")), int(match.group("gpu"))
+
+
+def is_gpu_route_variant_id(model_id: str) -> bool:
+    """True for the per-card routes `gpu_route_variants` publishes."""
+    return split_gpu_route_variant(model_id)[0] is not None
+
+
+def is_disposable_route_id(model_id: str) -> bool:
+    """True for a route that exists only to hold a spare copy of a model.
+
+    A ``__gpuN`` variant and a ``__replica_N`` are both replaceable while their base
+    route stays published, so losing one costs a reload rather than a client-visible
+    model. A base route id is never disposable, and only the suffix makes a route
+    one: an unrecognised id has to be resolved to its base before it can count.
+    """
+    return is_gpu_route_variant_id(model_id) or is_replica_model_id(model_id)
+
+
+# llama-swap evicts the LOWEST evict_costs entry first, so a smaller factor means
+# "cheaper to lose". Ordered variant < replica < base, cheapest tier first.
+VARIANT_ROUTE_COST_FACTOR = 0.25
+REPLICA_ROUTE_COST_FACTOR = 0.5
+BASE_ROUTE_COST_FACTOR = 1.0
+
+
+def route_eviction_cost_factor(model_id: str) -> float:
+    """What one MiB of a route is worth when llama-swap picks a victim.
+
+    - a ``__gpuN`` variant is cheapest: it exists only to park a model on a card its
+      base route does not own, so it can always be rebuilt from the still-published
+      base;
+    - a ``__replica_N`` costs half: a conversation bound to it is re-affinitised and
+      the base keeps serving everything else;
+    - a base route is full price, because it is the id every client asks for and
+      dropping it costs a cold reload for everybody.
+
+    Live request state is deliberately absent: this render stays a pure function of
+    the catalog, and what is streaming right now is what the admission gate
+    (``evict_disposable_route_for_load``) refuses to sacrifice.
+    """
+    if is_gpu_route_variant_id(model_id):
+        return VARIANT_ROUTE_COST_FACTOR
+    if is_replica_model_id(model_id):
+        return REPLICA_ROUTE_COST_FACTOR
+    return BASE_ROUTE_COST_FACTOR
+
+
+def route_evict_cost(size_mib: float, model_id: str) -> int:
+    """One llama-swap ``evict_costs`` entry.
+
+    ``max(1, ...)`` is load-bearing: a cost of 0 would make a tiny route look free to
+    lose, and llama-swap takes the cheapest entry even when it is the only thing
+    loaded.
+    """
+    return max(1, int(float(size_mib or 0.0) * route_eviction_cost_factor(model_id)))
+
+
 def _infer_base_gpu_count(model: ManagedModel) -> int:
     try:
         raw = (model.server_overrides or {}).get("gpu_count")
@@ -387,6 +458,42 @@ def _infer_base_gpu_count(model: ManagedModel) -> int:
         return max(1, len(parts))
     except Exception:
         return 1
+
+
+def _replica_fits_cards(
+    model: ManagedModel,
+    cfg: ReplicaConfig,
+    gpu_set: list[int],
+    base_cards: set[int],
+) -> bool:
+    """Whether every card of ``gpu_set`` can hold the copies this replica puts on it.
+
+    This is the whole capacity rule for sharing a card with the base, and it has to
+    stay a pure function of the catalog plus the configured card capacity: the answer
+    is written into config.yaml's CUDA_VISIBLE_DEVICES, so a live reading here would
+    make two renders of one catalog disagree, change the file under a running
+    llama-swap, and make the tests unpinnable.
+
+    Each side is charged its whole process footprint, weights *and* the KV cache and
+    compute buffers it needs - comparing raw weights against a card that has to hold
+    two processes is what admitted loads that then OOMed. A model whose footprint
+    cannot be measured never shares - an unknown cost is not a small cost.
+
+    The estimator is read off ``cli.models`` at call time rather than imported by
+    name: `llamacpp_stack.cli` resolves its own attributes by probing this module
+    first, so a bare import here would make `mock.patch` on the package attribute
+    delete the name from `_cli_impl` instead of restoring it.
+    """
+    runtime_mib = _models.estimate_model_runtime_mib(model)
+    if runtime_mib is None or runtime_mib <= 0.0:
+        return False
+    replica_share = runtime_mib / max(1, len(gpu_set))
+    base_share = runtime_mib / max(1, len(base_cards))
+    return all(
+        replica_share + (base_share if gpu in base_cards else 0.0) + cfg.safety_vram_mib
+        <= cfg.gpu_capacity_mib
+        for gpu in gpu_set
+    )
 
 
 def _replica_gpu_sets(
@@ -404,27 +511,51 @@ def _replica_gpu_sets(
         total = max(cfg.gpus_per_replica, _infer_base_gpu_count(model))
     gpr = max(1, cfg.gpus_per_replica or _infer_base_gpu_count(model))
     sets: list[list[int]] = []
+    # An explicit assignment replaces the "base owns the first N" default.
+    base_cards = (
+        {int(g) for g in base_gpu_set}
+        if base_gpu_set
+        else set(range(_infer_base_gpu_count(model)))
+    )
     if cfg.placement == "exclusive_gpus":
-        base_gpu_count = max(0, _infer_base_gpu_count(model))
-        # Replicas must avoid every GPU their base owns, or a base pinned to GPU1
-        # would hand its own replica GPU1 and the pair could never coexist. An
-        # explicit assignment replaces the "base owns the first N" default.
-        owned = (
-            {int(g) for g in base_gpu_set}
-            if base_gpu_set
-            else set(range(base_gpu_count))
-        )
-        # They must also avoid the cards other models' bases were assigned, or a
+        # Replicas must avoid every GPU another model's base was assigned, or a
         # replica lands on a neighbour's only card and the two evict each other
         # forever: the replica is cheaper, so it wins, then the base takes it back.
-        owned |= {int(g) for g in (reserved_gpu_set or set())}
-        available = [g for g in range(total) if g not in owned]
+        forbidden = base_cards | {int(g) for g in (reserved_gpu_set or set())}
+        available = [g for g in range(total) if g not in forbidden]
         for start in range(0, len(available), gpr):
             gpu_set = available[start:start + gpr]
             if len(gpu_set) == gpr:
                 sets.append(gpu_set)
             if len(sets) >= cfg.max:
                 break
+        # Their own base's cards are the fallback home, taken only when no card is
+        # free: two copies of one model hold no neighbour hostage, so there is no
+        # eviction ping-pong to avoid, and the matrix declares the pair co-loadable.
+        # Without it a fleet whose every card is somebody's base publishes no replica
+        # at all, which is what `replicas.enabled` looked broken on a two-card host.
+        if not sets:
+            own = sorted(g for g in base_cards if 0 <= g < total)
+            for start in range(0, len(own) - gpr + 1, gpr):
+                gpu_set = own[start:start + gpr]
+                if len(gpu_set) == gpr and _replica_fits_cards(model, cfg, gpu_set, base_cards):
+                    sets.append(gpu_set)
+                if len(sets) >= cfg.max:
+                    break
+        if not sets and gpr == 1:
+            # A card another model's base owns, charged only this replica's own share:
+            # this model's base is not on that card, so the two-copy test above does
+            # not apply. Safe because evict_costs makes a replica cheaper to lose than
+            # any base, and a displaced neighbour has its own per-card variant route.
+            foreign = sorted(
+                g for g in (reserved_gpu_set or set())
+                if 0 <= g < total and g not in base_cards
+            )
+            for gpu in foreign:
+                if _replica_fits_cards(model, cfg, [gpu], base_cards):
+                    sets.append([gpu])
+                if len(sets) >= cfg.max:
+                    break
     else:
         for idx in range(cfg.max):
             if gpr == 1:
@@ -531,7 +662,15 @@ def cached_model_gpu_sets(
 
 
 def reserved_base_gpus(catalog: list[ManagedModel], model_id: str, total_gpus: int | None = None) -> set[int]:
-    """GPUs assigned to some *other* model's base; off-limits for this model's replicas."""
+    """GPUs assigned to some *other* model's base; off-limits for this model's replicas.
+
+    Derived from the catalog alone, on purpose. This result gets baked into the
+    rendered routes' CUDA_VISIBLE_DEVICES, so it must be a function of the catalog
+    and nothing else: narrowing it by which models happen to be loaded right now
+    would make config.yaml depend on transient load state, two renders of the same
+    catalog would disagree, and the tests could not pin it down. Freeing an idle
+    card is a request-time decision (see _replica_gpu_sets), not a rendering one.
+    """
     assignment = cached_model_gpu_sets(catalog, total_gpus)
     return {
         int(gpu)
@@ -541,19 +680,24 @@ def reserved_base_gpus(catalog: list[ManagedModel], model_id: str, total_gpus: i
     }
 
 
-def iter_catalog_with_replicas(catalog: list[ManagedModel], global_replica_config: dict[str, object] | None = None) -> list[tuple[ManagedModel, str | None, list[int] | None]]:
-    """Return (model, public_base_model_id, gpu_set). public_base_model_id is set for internal replicas."""
+def iter_catalog_with_replicas(catalog: list[ManagedModel], global_replica_config: dict[str, object] | None = None, *, total_gpus: int | None = None) -> list[tuple[ManagedModel, str | None, list[int] | None]]:
+    """Return (model, public_base_model_id, gpu_set). public_base_model_id is set for internal replicas.
+
+    ``total_gpus`` pins the device count the placement is computed against, so a
+    caller that already probed once (the render) cannot see a different answer
+    halfway through its own decision.
+    """
     result: list[tuple[ManagedModel, str | None, list[int]]] = []
     for model in catalog:
         result.append((model, None, None))
-        cfg = get_model_replica_config(model, global_replica_config)
+        cfg = get_model_replica_config(model, global_replica_config, total_gpus=total_gpus)
         if not cfg.enabled:
             continue
-        assigned = cached_model_gpu_sets(catalog).get(model.model_id)
+        assigned = cached_model_gpu_sets(catalog, total_gpus).get(model.model_id)
         for idx, gpu_set in enumerate(
             _replica_gpu_sets(
-                model, cfg, base_gpu_set=assigned,
-                reserved_gpu_set=reserved_base_gpus(catalog, model.model_id),
+                model, cfg, total_gpus, base_gpu_set=assigned,
+                reserved_gpu_set=reserved_base_gpus(catalog, model.model_id, total_gpus),
             )
         ):
             result.append((build_replica_model(model, idx, gpu_set), model.model_id, gpu_set))
@@ -561,8 +705,27 @@ def iter_catalog_with_replicas(catalog: list[ManagedModel], global_replica_confi
 
 
 def iter_catalog_base_models(catalog: list[ManagedModel]) -> list[tuple[ManagedModel, str | None, list[int] | None]]:
-    """Return only public/base catalog models for the static llama-swap config."""
+    """Return only public/base catalog models, for callers that must not see replicas."""
     return [(model, None, None) for model in catalog]
+
+
+def _replica_capacity_refusal(model: ManagedModel, cfg: ReplicaConfig) -> str:
+    """Why no card could take this replica, in the numbers an operator can act on."""
+    size_mib = _get_model_size_mib(model)
+    if size_mib <= 0.0:
+        return (
+            "the model's size is unreadable, so no card is assumed able to hold a "
+            "second copy; check the local_path of the model in catalog.json"
+        )
+    needed_mib = 2 * size_mib + cfg.safety_vram_mib
+    return (
+        f"two copies of {int(size_mib)} MiB plus safety_vram_mib={cfg.safety_vram_mib} "
+        f"need {int(needed_mib)} MiB on one card and replicas.gpu_capacity_mib="
+        f"{cfg.gpu_capacity_mib} leaves it {max(0, int(needed_mib - cfg.gpu_capacity_mib))} "
+        f"MiB short; set replicas.gpu_capacity_mib to the card's real capacity or lower "
+        f"replicas.safety_vram_mib to at most "
+        f"{max(0, int(cfg.gpu_capacity_mib - 2 * size_mib))}"
+    )
 
 
 def summarize_configured_replicas(catalog: list[ManagedModel], global_replica_config: dict[str, object] | None = None) -> list[str]:
@@ -583,24 +746,22 @@ def summarize_configured_replicas(catalog: list[ManagedModel], global_replica_co
             )
         else:
             lines.append(
-                f"{model.model_id}: replicas enabled but no GPU set generated (gpus_per_replica={cfg.gpus_per_replica}, max={cfg.max})"
+                f"{model.model_id}: replicas enabled but no replica card - "
+                f"{_replica_capacity_refusal(model, cfg)} "
+                f"(gpus_per_replica={cfg.gpus_per_replica}, max={cfg.max})"
             )
     return lines
 
 
 def _get_model_size_mib(m: ManagedModel) -> float:
-    """Estimate model size in MiB for GGUF files and HF snapshots."""
-    try:
-        path = Path(m.local_path)
-        if path.is_dir():
-            return sum(
-                file_path.stat().st_size
-                for file_path in path.rglob("*")
-                if file_path.is_file()
-            ) / (1024 * 1024)
-        return float(path.stat().st_size) / (1024 * 1024)
-    except Exception:
-        return 0.0
+    """Weight bytes on disk, 0.0 when unreadable.
+
+    About the weights alone, not what loading them costs: ordering, the packable
+    threshold and eviction prices are weight questions, while "will this fit" goes
+    through `cli.models.estimate_model_runtime_mib`.
+    """
+    measured = _models.model_weights_size_mib(m)
+    return 0.0 if measured is None else measured
 
 
 def _is_embedding_model(m: ManagedModel) -> bool:
@@ -638,6 +799,11 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
       given half the eviction cost of its base, so the router drops the spare
       copy and keeps the original; requests for that model then queue on the
       original instead of paying for a full reload.
+    - A ``__gpuN`` per-card variant needs no rule of its own: it shares its base's
+      group exactly when it sits on a card its base does not own, and lands in its
+      own group when it shares one, so the two are never declared loadable together
+      while they hold the same GPU. Its eviction cost is the lowest tier, below the
+      replica's - see `route_eviction_cost_factor`.
     """
     if not models_info:
         return {}
@@ -683,37 +849,22 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
         if is_replica_model_id(mid):
             base_to_replicas.setdefault(replica_base_model_id(mid), []).append(mid)
 
-    def _resolve_group_gpus(model_id: str) -> set[int] | None:
-        mi = next((x for x in models_info if x["id"] == model_id), None)
-        if mi is None:
-            return None
-        gpus = set(mi.get("_effective_gpu_set") or set(mi.get("gpu_set") or []))
-        if not gpus and not mi["is_small"] and not mi["is_embedding"]:
-            return set(all_known_gpus)
-        return gpus
-
     def _merge_group(members: list[str]) -> None:
         for group in large_groups:
             for mid in members:
                 if mid in group:
                     group.remove(mid)
-        large_groups[:] = [g for g in large_groups if g]
+        large_groups[:] = [group for group in large_groups if group]
         large_groups.append(list(members))
-
-    def _group_fits_disjointly(members: list[str]) -> bool:
-        member_gpus = [_resolve_group_gpus(mid) for mid in members]
-        if any(g is None for g in member_gpus):
-            return False
-        return all(
-            member_gpus[i].isdisjoint(member_gpus[j])  # type: ignore[union-attr]
-            for i in range(len(member_gpus))
-            for j in range(i + 1, len(member_gpus))
-        )
 
     for base, rids in base_to_replicas.items():
         members = [base, *rids]
-        if not _group_fits_disjointly(members):
-            continue
+        # No disjointness test: a replica that shares its base's card was only
+        # published because that card was measured to hold both copies (see
+        # _replica_fits_cards), so the pair has to be declared co-loadable. Splitting
+        # them would make llama-swap evict the base to load its own replica, which is
+        # not parallelism at all. Whether the pair actually fits is the gateway's
+        # admission gate's answer, not the matrix's.
         _merge_group(members)
     cross_pairs: list[list[str]] = []
     for idx, first in enumerate(larges):
@@ -724,11 +875,14 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
                 cross_pairs.append([first["id"], second["id"]])
     matrix_sets = {}
     for idx, group in enumerate(large_groups):
-        group_vars = [id_to_var[model_id] for model_id in sorted(group + packables) if model_id in id_to_var]
+        # A base and its own replicas are also packables, so `group + packables`
+        # repeats every member of a merged base+replica group; dedupe or the set
+        # expression asks llama-swap for the same variable twice.
+        group_vars = [id_to_var[model_id] for model_id in sorted(set(group + packables)) if model_id in id_to_var]
         if group_vars:
             matrix_sets[f"group_{idx}"] = " & ".join(group_vars)
     for idx, pair in enumerate(cross_pairs):
-        pair_vars = [id_to_var[model_id] for model_id in sorted(pair + packables) if model_id in id_to_var]
+        pair_vars = [id_to_var[model_id] for model_id in sorted(set(pair + packables)) if model_id in id_to_var]
         if pair_vars:
             matrix_sets[f"pair_{idx}"] = " & ".join(pair_vars)
     if not large_groups and packables:
@@ -736,7 +890,7 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
         if packable_vars:
             matrix_sets["packables"] = " & ".join(packable_vars)
     evict_costs = {
-        id_to_var[m["id"]]: max(1, int(m["size_mib"] * (0.5 if is_replica_model_id(m["id"]) else 1.0)))
+        id_to_var[m["id"]]: route_evict_cost(m["size_mib"], m["id"])
         for m in models_info
         if m["id"] in id_to_var
     }
@@ -825,6 +979,36 @@ def shell_quote(v):
     if re.fullmatch(r"[A-Za-z0-9_./:=,+-]+", v):
         return v
     return "'" + v.replace("'", "'\"'\"'") + "'"
+
+
+def gpu_route_variants(model: ManagedModel, total_gpus: int) -> list[tuple[str, list[int]]]:
+    """Pre-rendered per-card routes for a base model.
+
+    Choosing which card a model runs on used to mean rewriting its
+    ``CUDA_VISIBLE_DEVICES``, and every such rewrite is a whole-file write that
+    llama-swap answers by tearing down every loaded model. Publishing one route
+    per card up front turns "put this model on the free GPU" into picking an
+    already-published route id, so no request ever has to write config.yaml.
+
+    Only single-GPU, non-small, non-embedding, non-derived models get variants:
+    the others either share a card with anything or carry a forced ``--model-id``
+    that would collide with the base route's published name.
+    """
+    if total_gpus < 2:
+        return []
+    if _is_embedding_model(model) or _is_small_model(model):
+        return []
+    if _infer_base_gpu_count(model) != 1:
+        return []
+    model_id = str(model.model_id)
+    derived = (
+        model_id.endswith("+template")
+        or model_id.endswith("+spec")
+        or bool(getattr(model, "speculative", None))
+    )
+    if derived:
+        return []
+    return [(f"{model_id}__gpu{gpu}", [gpu]) for gpu in range(total_gpus)]
 
 
 def render_llamaswap_config(
@@ -940,7 +1124,12 @@ def render_llamaswap_config(
 
     total_gpus = detect_cuda_device_count()
     gpu_assignment = cached_model_gpu_sets(catalog, total_gpus)
-    for m, public_base_model_id, replica_gpu_set in sorted(iter_catalog_base_models(catalog), key=lambda item: item[0].model_id):
+    # Replicas enter the render here, and that is what removes the last request-time
+    # config.yaml write: llama-swap runs --watch-config, so a scale-out that had to
+    # bolt a __replica_N route onto the file unloaded every model and dropped every
+    # KV cache. Published here they are ordinary routes, and the only write a
+    # request can still make is the projector attach, which rewrites one route.
+    for m, public_base_model_id, replica_gpu_set in sorted(iter_catalog_with_replicas(catalog, replica_defaults, total_gpus=total_gpus), key=lambda item: item[0].model_id):
         use_model = m
         cmd = _render_cmd(use_model, bool(resolve_render_include_mmproj(use_model, mmproj_config)))
         base_gpu_set: list[int] | None = None
@@ -990,6 +1179,29 @@ def render_llamaswap_config(
             data["models"][m.model_id]["metadata"] = {"internal_replica_of": public_base_model_id}
         if public_base_model_id is None and m.aliases:
             data["models"][m.model_id]["aliases"] = m.aliases
+        if public_base_model_id is None:
+            for variant_id, variant_gpus in gpu_route_variants(m, total_gpus):
+                if variant_id in data["models"]:
+                    continue
+                variant_cmd = _set_cuda_visible_devices(list(cmd), variant_gpus)
+                variant_entry = {
+                    "cmd": " ".join(shell_quote(part) for part in variant_cmd),
+                    "checkEndpoint": "/health",
+                    "ttl": int(idle_ttl),
+                }
+                variant_entry["capabilities"] = route_capabilities(variant_entry)
+                variant_entry["metadata"] = {
+                    "route_variant_of": m.model_id,
+                    "gpu_variant": variant_gpus[0],
+                }
+                data["models"][variant_id] = variant_entry
+                models_info_for_matrix.append({
+                    "id": variant_id,
+                    "gpu_set": list(variant_gpus),
+                    "is_embedding": False,
+                    "is_small": False,
+                    "size_mib": _get_model_size_mib(m),
+                })
         if m.description:
             data["models"][m.model_id]["description"] = m.description
     matrix_config = _calculate_llama_swap_matrix(models_info_for_matrix)

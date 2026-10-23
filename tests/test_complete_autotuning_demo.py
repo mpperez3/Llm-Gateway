@@ -8,7 +8,12 @@ Demonstrates:
 """
 
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _real_test_model import ensure_real_test_model
 
 def validate_complete_pipeline():
     """Validate autotuning pipeline end-to-end."""
@@ -35,7 +40,7 @@ def validate_complete_pipeline():
     print("\n[SECTION 1: LOAD TUNING - direct_io Mechanism]")
     print("-" * 80)
     
-    model_path = Path(__file__).parent / "models" / "test-model.gguf"
+    model_path = ensure_real_test_model()
     
     model_base = ManagedModel(
         model_id="test-model",

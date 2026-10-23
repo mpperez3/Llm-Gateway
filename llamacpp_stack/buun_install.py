@@ -18,7 +18,37 @@ import sys
 from pathlib import Path
 
 DEFAULT_BUUN_REPO = "spiritbuun/buun-llama-cpp"
-DEFAULT_BUUN_REF = "c7f114d"
+DEFAULT_BUUN_REF = "8172dd1463a10b7bb17ef7c6c4975c062debbcbf"
+BUUN_WRAPPER = """#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REAL="$ROOT/llama-server-buun.real"
+prepend_ld() {
+  local dir="$1"
+  if [[ -d "$dir" ]]; then
+    case ":${LD_LIBRARY_PATH:-}:" in
+      *":$dir:"*) ;;
+      *) export LD_LIBRARY_PATH="$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+    esac
+  fi
+}
+prepend_ld "$ROOT/../lib"
+prepend_ld "$ROOT"
+prepend_ld "$ROOT/../build/bin"
+prepend_ld "$ROOT/../../cuda/lib"
+prepend_ld "$ROOT/../../cuda/lib64"
+prepend_ld "$ROOT/../../nccl/lib"
+prepend_ld "$ROOT/../../nccl/lib64"
+args=()
+skip_next=false
+for arg in "$@"; do
+  if $skip_next; then skip_next=false; continue; fi
+  if [[ "$arg" == "--provider" ]]; then skip_next=true; continue; fi
+  args+=("$arg")
+done
+set -- "${args[@]}"
+exec "$REAL" "$@"
+"""
 
 _DRIVER_MAX_CUDA = {
     525: 12.0,
@@ -27,6 +57,13 @@ _DRIVER_MAX_CUDA = {
     550: 12.4,
     555: 12.5,
     560: 12.6,
+    570: 12.8,
+    575: 12.9,
+    580: 13.0,
+    590: 13.1,
+    595: 13.2,
+    610: 13.3,
+    615: 13.4,
 }
 
 
@@ -67,6 +104,50 @@ def _nvcc_cuda_version(nvcc_path: str) -> float:
     except Exception:
         pass
     return 999.0
+
+
+def _cuda_root_has_cudart(root: Path) -> bool:
+    """True when a CUDA toolkit root ships libcudart in a CMake-visible dir."""
+    for sub in ("lib64", "lib", "targets/x86_64-linux/lib"):
+        lib = root / sub
+        if (lib / "libcudart.so").exists() or (lib / "libcudart.so.13").exists():
+            return True
+    return False
+
+
+def _find_system_cuda_toolkit(max_version: float) -> Path | None:
+    """Pick the newest side-by-side /usr/local/cuda-* toolkit usable by the driver.
+
+    The pip nvidia-cu13 tree can expose nvcc and headers while CMake's
+    FindCUDAToolkit still fails with ``CUDA_CUDART missing`` on older buun
+    trees. A real system toolkit that ships libcudart avoids that failure.
+    """
+    try:
+        roots = list(Path("/usr/local").glob("cuda*"))
+    except OSError:
+        return None
+    candidates: list[tuple[float, Path]] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        nvcc = root / "bin" / "nvcc"
+        if not nvcc.exists() or not _cuda_root_has_cudart(root):
+            continue
+        try:
+            version = _nvcc_cuda_version(str(nvcc))
+        except Exception:
+            continue
+        if version <= max_version:
+            candidates.append((version, root))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def _pick_compatible_nvcc(system_nvcc, pip_nvcc, driver_max_cuda: float):
@@ -187,6 +268,27 @@ def _bundled_patches_pending(buun_root: Path) -> bool:
     return current != _bundled_patch_fingerprint()
 
 
+def _patch_superseded(src_dir: Path, name: str) -> bool:
+    """True when upstream already contains what a bundled patch adds.
+
+    Reverse-probing cannot answer this: upstream reformats the surrounding lines
+    between releases, so neither direction applies even when the feature is there.
+    Match the feature's own line instead.
+    """
+    markers = {
+        "buun-exl3-shared-head-side-tensors.patch": (
+            "src/llama-model.cpp", "{ &dst->output_in_s, src->output_in_s",
+        ),
+    }
+    marker = markers.get(name)
+    if marker is None:
+        return False
+    try:
+        return marker[1] in (src_dir / marker[0]).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+
 def _apply_bundled_patches(src_dir: Path, dry_run: bool = False) -> list[str]:
     """Apply every bundled patch to src_dir, skipping ones already present.
 
@@ -217,6 +319,10 @@ def _apply_bundled_patches(src_dir: Path, dry_run: bool = False) -> list[str]:
             text=True,
         )
         if probe.returncode != 0:
+            if _patch_superseded(src_dir, name):
+                print(f"[*] bundled patch superseded upstream, skipping: {name}")
+                applied.append(name)
+                continue
             raise RuntimeError(
                 f"bundled patch {name} does not apply to {src_dir}: "
                 f"{(probe.stderr or probe.stdout or '').strip()}"
@@ -245,6 +351,32 @@ def _write_patch_stamp(buun_root: Path) -> None:
         print(f"[!] could not write patch stamp {buun_root / _PATCH_STAMP_NAME}: {exc}")
 
 
+def _checkout_buun_ref(src_dir: Path, ref: str) -> None:
+    try:
+        fetch = subprocess.run(
+            ["git", "-C", str(src_dir), "fetch", "--depth", "1", "origin", ref],
+            check=False,
+            timeout=30,
+        )
+    except Exception as exc:
+        print(f"[!] buun fetch {ref} failed: {exc}")
+        return
+    if fetch.returncode != 0:
+        print(f"[!] buun fetch {ref} failed; using current HEAD")
+        return
+    try:
+        checkout = subprocess.run(
+            ["git", "-C", str(src_dir), "checkout", ref],
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:
+        print(f"[!] buun checkout {ref} failed: {exc}")
+        return
+    if checkout.returncode != 0:
+        print(f"[!] buun checkout {ref} failed; using current HEAD")
+
+
 def build_buun(
     repo: str = DEFAULT_BUUN_REPO,
     ref: str = DEFAULT_BUUN_REF,
@@ -255,7 +387,7 @@ def build_buun(
     """Clone and build buun-llama-cpp, return binary path.
 
     Mirrors beellama_install.build_beellama with buun specifics:
-    - repo spiritbuun/buun-llama-cpp@c7f114d
+    - repo spiritbuun/buun-llama-cpp@8172dd1
     - bin buun/bin/llama-server-buun
     - cmake flags -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native (fallback 110/120)
     - rpath $ORIGIN via install helpers
@@ -326,28 +458,9 @@ def build_buun(
         if ref != DEFAULT_BUUN_REF and ref != "main":
             clone_args.extend(["--branch", ref])
         subprocess.run(clone_args, check=True, timeout=60)
-        # Ensure exact ref c7f114d when requested
-        if ref == DEFAULT_BUUN_REF:
-            try:
-                subprocess.run(
-                    ["git", "-C", str(src_dir), "fetch", "--depth", "1", "origin", ref],
-                    check=False,
-                    timeout=30,
-                )
-                subprocess.run(["git", "-C", str(src_dir), "checkout", ref], check=False, timeout=10)
-            except Exception:
-                pass
     else:
         print(f"[*] Updating {src_dir} to {ref}")
-        try:
-            subprocess.run(
-                ["git", "-C", str(src_dir), "fetch", "--depth", "1", "origin", ref],
-                check=False,
-                timeout=30,
-            )
-            subprocess.run(["git", "-C", str(src_dir), "checkout", ref], check=False, timeout=10)
-        except Exception:
-            pass
+    _checkout_buun_ref(src_dir, ref)
 
     _apply_bundled_patches(src_dir)
 
@@ -410,6 +523,12 @@ def build_buun(
         system_nvcc = locate_nvcc()
     except Exception:
         pass
+    # Prefer a side-by-side CUDA toolkit whose runtime ships libcudart. The
+    # pip nvidia-cu13 tree may expose nvcc/headers while CMake's
+    # FindCUDAToolkit still fails with "CUDA_CUDART missing" on older buun.
+    _side_toolkit = _find_system_cuda_toolkit(driver_max_cuda)
+    if _side_toolkit is not None:
+        system_nvcc = str(_side_toolkit / "bin" / "nvcc")
     try:
         pip_nvcc = locate_nvcc_for_python(python_exec)
     except Exception:
@@ -420,11 +539,14 @@ def build_buun(
         cuda_root = locate_cuda_root_for_python(python_exec)
     except Exception:
         pass
-    if nvcc and system_nvcc and str(Path(nvcc).resolve()) == str(Path(system_nvcc).resolve()):
+    # Keep nvcc and the toolkit root paired. The selected nvcc may be a
+    # side-by-side system toolkit; replacing it with the pip nvcc reintroduces
+    # the CMake "CUDA_CUDART missing" failure.
+    if nvcc:
         try:
-            system_cuda = Path(nvcc).parent.parent
-            if system_cuda.exists():
-                cuda_root = system_cuda
+            nvcc_path = Path(nvcc)
+            if nvcc_path.exists():
+                cuda_root = nvcc_path.resolve().parent.parent
         except Exception:
             pass
     nccl_root = None
@@ -485,6 +607,11 @@ def build_buun(
     pip_cuda_lib = Path(python_exec).parent.parent / "lib" / "python3.12" / "site-packages" / "nvidia" / "cu13" / "lib"
     pip_nccl_lib = Path(python_exec).parent.parent / "lib" / "python3.12" / "site-packages" / "nvidia" / "nccl" / "lib"
     rpath_list = [str(buun_lib_dir), str(build_dir / "bin")]
+    if cuda_root:
+        for _sub in ("lib64", "lib"):
+            _lib = cuda_root / _sub
+            if _lib.exists() and str(_lib) not in rpath_list:
+                rpath_list.append(str(_lib))
     if pip_cuda_lib.exists():
         rpath_list.append(str(pip_cuda_lib))
     if pip_nccl_lib.exists():
@@ -515,7 +642,7 @@ def build_buun(
             cmake_args.extend(["-DGGML_CUDA=ON"])
 
     cmake_args[0] = str(cmake_bin)
-    if shutil.which("ninja"):
+    if shutil.which("ninja") and "-G" not in cmake_args:
         cmake_args.extend(["-G", "Ninja"])
     if shutil.which("ccache"):
         cmake_args.extend(
@@ -576,7 +703,12 @@ def build_buun(
         src_bin = build_dir / "bin" / "llama-server-buun"
     if src_bin.exists():
         bin_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_bin, bin_path)
+        # The stable path stays a wrapper: it sets LD_LIBRARY_PATH for the bundled
+        # libs and drops --provider, which the gateway renders from catalog metadata
+        # but the engine has never accepted.
+        shutil.copy2(src_bin, bin_path.with_name(bin_path.name + ".real"))
+        bin_path.write_text(BUUN_WRAPPER, encoding="utf-8")
+        bin_path.chmod(0o755)
         for lib in (build_dir / "bin").glob("libggml*.so*"):
             try:
                 shutil.copy2(lib, buun_lib_dir / lib.name)

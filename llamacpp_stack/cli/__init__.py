@@ -51,7 +51,20 @@ from .constants import (
     default_tensor_split,
 )
 from .env import _env_path, _env_path2, _env_value, _is_vllm_backend, _load_installed_env
-from .models import LoadingBar, ManagedModel, ProbeTraceMetrics, ReplicaConfig, ReplicaRecord, Spinner
+from .models import (
+    LoadingBar,
+    ManagedModel,
+    ProbeTraceMetrics,
+    ReplicaConfig,
+    ReplicaRecord,
+    Spinner,
+    # Bound here rather than left to the __getattr__ fallbacks: mock.patch on this
+    # package only restores (instead of deleting) an attribute it finds in __dict__,
+    # and __delattr__ below cascades that delete into _cli_impl, where five call
+    # sites would then hit a NameError.
+    estimate_model_runtime_mib,
+    model_weights_size_mib,
+)
 
 _PARSER_EXPORTS = ("HelpFormatter", "_detect_requested_subcommand", "build_help_epilog", "build_cli_parser", "parse_cli_args")
 _parser_mod_cache = None

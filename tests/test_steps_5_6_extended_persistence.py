@@ -8,8 +8,15 @@ These tests validate:
 """
 
 import json
+import sys
 import unittest
 from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _real_test_model import ModelArtifactUnavailable, ensure_real_test_model
 
 from llamacpp_stack.auto_performance import (
     _estimate_trial_vram_mib,
@@ -18,17 +25,22 @@ from llamacpp_stack.auto_performance import (
     VRAM_ZONES,
 )
 
+pytestmark = pytest.mark.real_model
 
-REAL_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "SmolLM2-135M-Instruct-Q2_K.gguf"
 
-
-class Step5RepairAndVramTests(unittest.TestCase):
-    """Step 5: Extended tests for repair logic and VRAM estimation."""
+class RealModelTestCase(unittest.TestCase):
+    """Base class that provisions the auto-downloaded tiny GGUF."""
 
     @classmethod
     def setUpClass(cls) -> None:
-        if not REAL_MODEL_PATH.exists():
-            raise unittest.SkipTest(f"Missing real model artifact: {REAL_MODEL_PATH}")
+        try:
+            cls.real_model_path = str(ensure_real_test_model())
+        except ModelArtifactUnavailable as exc:
+            raise unittest.SkipTest(f"Missing real model artifact: {exc}") from exc
+
+
+class Step5RepairAndVramTests(RealModelTestCase):
+    """Step 5: Extended tests for repair logic and VRAM estimation."""
 
     def test_repair_determinism_same_config_same_result(self) -> None:
         """Validate that repair_until_feasible is deterministic.
@@ -51,7 +63,7 @@ class Step5RepairAndVramTests(unittest.TestCase):
             "vram_mib": [20480, 20480],  # 2x RTX 3090 (20GB each)
         }
         
-        model_path = str(REAL_MODEL_PATH)
+        model_path = self.real_model_path
         
         # Run repair twice
         repair1, log1 = repair_until_feasible(config, hw, model_path)
@@ -85,7 +97,7 @@ class Step5RepairAndVramTests(unittest.TestCase):
             "vram_mib": [8192],  # 8GB GPU
         }
         
-        model_path = str(REAL_MODEL_PATH)
+        model_path = self.real_model_path
         
         # Repair should always return a valid config
         repaired, repair_log = repair_until_feasible(config, hw, model_path)
@@ -301,7 +313,7 @@ class Step6PersistenceTests(unittest.TestCase):
                         "Updated profile should have new metrics")
 
 
-class IntegrationCompletionTests(unittest.TestCase):
+class IntegrationCompletionTests(RealModelTestCase):
     """Integration tests validating all 6 steps work together."""
 
     def test_complete_pipeline_repair_estimate_persist(self) -> None:
@@ -323,7 +335,7 @@ class IntegrationCompletionTests(unittest.TestCase):
         }
         
         hw = {"vram_mib": [12288]}  # 12GB GPU
-        model_path = str(REAL_MODEL_PATH)
+        model_path = self.real_model_path
         
         # Step 1: Estimate initial VRAM
         initial_breakdown = _estimate_vram_breakdown(model_path, initial_config, hw)

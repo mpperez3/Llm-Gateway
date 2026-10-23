@@ -233,8 +233,11 @@ uv run python tools/verify_llama_cmds.py
 ```
 
 Notas:
-- `pyproject.toml:28-30` define `pythonpath = ["."]` y `testpaths = ["tests"]`.
+- `pyproject.toml` define `pythonpath = ["."]`, `testpaths = ["tests"]` y el marker `real_model`.
 - Muchos tests usan fixtures/mocks para evitar GPU/descargas reales. Cambios que afecten hardware deben validarse en instalación real.
+- Los tests E2E/autotuning con modelo real (`@pytest.mark.real_model`) descargan bajo demanda el GGUF más pequeño válido de Hugging Face (`ggml-org/models::tinyllamas/stories260K.gguf`, ~1.2 MiB) a `models/` vía `tests/_real_test_model.py`. No hace falta colocar a mano un modelo grande. Overrides: `LLM_SERVER_TEST_GGUF_REPO`, `LLM_SERVER_TEST_GGUF_FILE`, `LLM_SERVER_TEST_GGUF_NAME`, `LLM_SERVER_TEST_MODEL_DIR`; `LLM_SERVER_TEST_MODEL_OFFLINE=1` desactiva la descarga (los tests se saltan). Warm-up en CI: `uv run python tests/_real_test_model.py`.
+- El benchmark live sigue gateado por `RUN_REAL_AUTO_PERF_E2E=1` y requiere CUDA.
+- El render smoke de exllama usa el fixture `tests/fixtures/qwen3.8_chat_template.jinja` (plantilla real, byte-idéntica a la del 27B) en vez de leer `/var/llamacpp_models/...`; override con `LLM_SERVER_TEST_CHAT_TEMPLATE`.
 - Antes de push, revisa `git diff --cached` y evita commitear secretos.
 
 ---
@@ -311,6 +314,7 @@ Ver `README.md#Troubleshooting` y `docs/LLM_INSTALL.md#8`.
 - `docs/LLM_INSTALL.md` — checklist canónico para agentes (pre-checks, Q1–Q8, matriz, comandos, verificación).
 - `llamacpp_stack/install.py` — fuente de verdad de prompts/flags (`prompt_bool`, `prompt_choice`, `resolve_*`, `build_cli_parser`).
 - `docs/DFLASH-SPEC.md` — MTP vs DFlash2: presupuesto de VRAM medido, trampa `ctx_size_draft:0`, coste de `--logits-all`, compat EXL3+DFlash2, patch requerido, y **la nota de que el servicio corre un snapshot (§8)**.
+- `docs/kv-cache-reuse-hybrid-qwen35.md` — por qué un turno que añade ~3k tokens reprocesa ~30k: `preserve_thinking=false` + plantilla posicional de Qwen3.5, checkpoints de modelo híbrido (reuse = último checkpoint ≤ LCP), captura/diff (`tools/compare_prompt_captures.py`) y palancas.
 - `docs/VLLM-BETA.md`, `docs/LOCAL_OLLAMA_SETUP.md`, `docs/arg-hyphen-conventions.md`, `docs/flags_llamacpp`, `docs/lllamacpp_flags_API.md`.
 - `skills/llm-server-autotune/SKILL.md` — loop de autotuning.
 

@@ -269,7 +269,7 @@ llama-server -hf turboderp/Qwen3.8-27B-exl3 -ngl auto --fit on  # si buun es el 
 | **BF16** | `quant_method: exl3` | Safetensors BF16, no requiere quant GGUF |
 | **NVFP4 / FP8 misc** | `quant_method: exl3` (buun) o `vllm` | Buun para EXL3-native; vLLM para HF NVFP4 (`docs/VLLM-BETA.md`) |
 
-Defaults buun (`llamacpp_stack/bundle/llama_server_defaults.yaml:buun`): `cache_quant 4`, `grid_size 110`, `keep 40000`, `cache_ram 65536` — mismo que `qwen3.8-27b-EXL3` catalog entry (EXL3 3.5bpw → EXL3_3/4 mix). Instala con `--optionals buun` (`spiritbuun/buun-llama-cpp@c7f114d`, bin `buun/bin/llama-server-buun`). Verificar: `cat config.yaml | grep buun`, `buun/bin/llama-server-buun --help | grep -qi exl3`.
+Defaults buun (`llamacpp_stack/bundle/llama_server_defaults.yaml:buun`): `cache_quant 4`, `grid_size 110`, `keep 40000`, `cache_ram 65536` — mismo que `qwen3.8-27b-EXL3` catalog entry (EXL3 3.5bpw → EXL3_3/4 mix). Instala con `--optionals buun` (`spiritbuun/buun-llama-cpp@8172dd1`, bin `buun/bin/llama-server-buun`). Verificar: `cat config.yaml | grep buun`, `buun/bin/llama-server-buun --help | grep -qi exl3`.
 
 ## 7. Ficheros clave (no editar `config.yaml` a mano)
 

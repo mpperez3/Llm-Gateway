@@ -13,9 +13,16 @@ Run with: python -m pytest tests/test_e2e_autotuning_integration.py -v
 
 import json
 import os
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _real_test_model import ModelArtifactUnavailable, ensure_real_test_model, repo_id
 
 from llamacpp_stack.cli import ManagedModel, build_llama_server_command
 from llamacpp_stack.auto_performance import (
@@ -29,24 +36,25 @@ from llamacpp_stack.auto_performance import (
     score_server_performance,
 )
 
-
-REAL_E2E_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "SmolLM2-135M-Instruct-Q2_K.gguf"
+pytestmark = pytest.mark.real_model
 
 
 class AutotuningEndToEndTests(unittest.TestCase):
     """Integration tests for complete autotuning pipelines."""
 
     def setUp(self) -> None:
-        """Set up test fixtures."""
-        if not REAL_E2E_MODEL_PATH.exists():
-            self.skipTest(f"Missing real E2E model: {REAL_E2E_MODEL_PATH}")
+        """Set up test fixtures against the auto-provisioned tiny GGUF."""
+        try:
+            self.real_model_path = ensure_real_test_model()
+        except ModelArtifactUnavailable as exc:
+            self.skipTest(f"Missing real E2E model: {exc}")
 
         self.model = ManagedModel(
-            model_id="SmolLM2-135M-Instruct-Q2_K",
-            repo_id="unsloth/SmolLM2-135M-Instruct-GGUF",
-            quant="Q2_K",
-            filename=REAL_E2E_MODEL_PATH.name,
-            local_path=str(REAL_E2E_MODEL_PATH),
+            model_id=self.real_model_path.stem,
+            repo_id=repo_id(),
+            quant=None,
+            filename=self.real_model_path.name,
+            local_path=str(self.real_model_path),
             ctx_size=4096,
             n_gpu_layers=999,
         )
@@ -144,13 +152,13 @@ class AutotuningEndToEndTests(unittest.TestCase):
         self.assertIn("--batch-size", shared_cmd_str, "Shared builder should respect batch_size")
         self.assertNotIn("--direct-io", shared_cmd_str, "Shared builder prunes unsupported direct_io catalog override")
 
-    @unittest.skipUnless(os.getenv("RUN_REAL_AUTO_PERF_E2E") == "1", "Set RUN_REAL_AUTO_PERF_E2E=1 to run the live SmolLM2 benchmark")
-    def test_real_smollm2_benchmark_produces_nonzero_baseline(self) -> None:
+    @unittest.skipUnless(os.getenv("RUN_REAL_AUTO_PERF_E2E") == "1", "Set RUN_REAL_AUTO_PERF_E2E=1 to run the live tiny-model benchmark")
+    def test_real_tiny_model_benchmark_produces_nonzero_baseline(self) -> None:
         """Run a short live benchmark and ensure the baseline is not broken.
 
-        This is an actual end-to-end check against the real SmolLM2 GGUF.
-        It should fail if the load path regresses back to a zero-throughput
-        baseline or a hard -1000 score.
+        This is an actual end-to-end check against the auto-provisioned tiny
+        GGUF (see ``tests/_real_test_model.py``). It should fail if the load
+        path regresses back to a zero-throughput baseline or a hard -1000 score.
         """
         gpu_count = detect_cuda_device_count()
         if gpu_count <= 0:

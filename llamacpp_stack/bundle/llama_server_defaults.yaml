@@ -87,7 +87,7 @@ mtp_defaults:
   spec_draft_n_min: 0
   spec_draft_p_min: 0.75
 
-# buun (EXL3 native) — spiritbuun/buun-llama-cpp c7f114d
+# buun (EXL3 native) — spiritbuun/buun-llama-cpp 8172dd1
 # Native safetensors engine for EXL3 (+ FP8/BF16/NVFP4). Applied when
 # catalog entry has server_overrides.engine == "buun" (see T2 buun_install.py).
 # Quant: 3.5bpw EXL3 -> EXL3_3/4 mix, FP8_BLOCK 128, BF16 (91 types vs 43 mainline).

@@ -367,11 +367,33 @@ def test_user_stop_in_generate_full_stop_conditions(monkeypatch):
     assert any(s in ("<|im_end|>", "</im_end>", "\u003c/im_end\u003e") for s in sc)
 
 
+def _chat_template_path():
+    """Locate the chat template used by the render smoke test.
+
+    The test used to read the template straight out of a multi-GB model
+    directory, which made it depend on a large local artifact. The template is
+    a small text file, so a versioned copy lives under ``tests/fixtures`` and is
+    the default. ``LLM_SERVER_TEST_CHAT_TEMPLATE`` can point at a live copy when
+    the template itself is being changed.
+    """
+    import os, pathlib
+
+    candidates = []
+    override = os.environ.get("LLM_SERVER_TEST_CHAT_TEMPLATE", "").strip()
+    if override:
+        candidates.append(pathlib.Path(override))
+    candidates.append(pathlib.Path(__file__).resolve().parent / "fixtures" / "qwen3.8_chat_template.jinja")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def test_smoke_render_tokenizer_only_no_gpu():
-    import pathlib, json
-    tmpl_path = pathlib.Path("/var/llamacpp_models/Qwen3.8-27B-EXL3-3.5bpw/chat_template.jinja")
-    if not tmpl_path.exists():
-        pytest.skip("27B jinja not present")
+    import json
+    tmpl_path = _chat_template_path()
+    if tmpl_path is None:
+        pytest.skip("chat template fixture not present")
     try:
         import jinja2
     except ImportError:

@@ -9,11 +9,28 @@ Real end-to-end validation of autotuning system:
 
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _real_test_model import ModelArtifactUnavailable, ensure_real_test_model
+
+pytestmark = pytest.mark.real_model
+
 # Test configuration
-MODEL_PATH = Path(__file__).parent.parent / "models" / "test-model.gguf"
+MODEL_PATH: Path | None = None
+
+
+def _model_path() -> Path:
+    """Return the auto-provisioned tiny GGUF, downloading it on first use."""
+    global MODEL_PATH
+    if MODEL_PATH is None:
+        MODEL_PATH = ensure_real_test_model()
+    return MODEL_PATH
 LLAMA_SERVER = Path.home() / ".local/opt/llm-server/llama-server"
 LEGACY_LLAMA_SERVER = Path.home() / ".local/opt/heimdall-gateway/llama-server"
 FALLBACK_SERVER = Path(__file__).resolve().parents[1] / "llama.cpp-source" / "build" / "bin" / "llama-server"
@@ -27,10 +44,12 @@ def find_llama_server():
 
 def test_model_exists():
     """Verify test model is available."""
-    if not MODEL_PATH.exists():
-        print(f"❌ Model not found: {MODEL_PATH}")
+    try:
+        model = _model_path()
+    except ModelArtifactUnavailable as exc:
+        print(f"❌ Model unavailable: {exc}")
         return False
-    print(f"✓ Model found: {MODEL_PATH} ({MODEL_PATH.stat().st_size / (1024*1024):.1f} MB)")
+    print(f"✓ Model found: {model} ({model.stat().st_size / (1024*1024):.1f} MB)")
     return True
 
 def test_server_binary_exists():
@@ -45,14 +64,14 @@ def test_server_binary_exists():
 def test_basic_benchmark():
     """Run a basic benchmark to verify server works."""
     server = find_llama_server()
-    if not server or not MODEL_PATH.exists():
+    if not server or not _model_path().exists():
         print("⊘ Skipping basic benchmark (requirements not met)")
         return None
     
     # Build minimal command
     cmd = [
         str(server),
-        "--model", str(MODEL_PATH),
+        "--model", str(_model_path()),
         "--ctx-size", "512",
         "--batch-size", "128",
         "--ubatch-size", "32",
@@ -99,7 +118,7 @@ def test_flag_emission():
     
     benchmark_params = _prepare_benchmark_params(trial_params, api_mode=False)
     cmd = _build_benchmark_command(
-        model_path=str(MODEL_PATH),
+        model_path=str(_model_path()),
         params=benchmark_params,
         ctx_size=512,
     )
@@ -128,7 +147,7 @@ def test_direct_io_flag_variants():
         repo_id="test/repo",
         quant="q8_0",
         filename="test.gguf",
-        local_path=str(MODEL_PATH),
+        local_path=str(_model_path()),
         ctx_size=512,
         n_gpu_layers=0,
     )
@@ -258,10 +277,10 @@ def test_repair_mechanism():
     print(f"  Hardware: 4GB VRAM")
     
     repaired, repair_log = repair_until_feasible(
-        oversized_config, hw, str(MODEL_PATH)
+        oversized_config, hw, str(_model_path())
     )
     
-    breakdown = _estimate_vram_breakdown(str(MODEL_PATH), repaired, hw)
+    breakdown = _estimate_vram_breakdown(str(_model_path()), repaired, hw)
     total_needed = breakdown["total"]
     budget = breakdown["budget"]
     
@@ -281,7 +300,13 @@ def main():
     print("=" * 70)
     print("END-TO-END AUTOTUNING SYSTEM VALIDATION")
     print("=" * 70)
-    
+
+    try:
+        _model_path()
+    except ModelArtifactUnavailable as exc:
+        print(f"❌ Real test model unavailable: {exc}")
+        return 2
+
     results = {
         "Model exists": test_model_exists(),
         "Server binary exists": test_server_binary_exists(),

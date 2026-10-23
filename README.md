@@ -1,4 +1,4 @@
-/# LLM Server
+# LLM Server
 
 > **Are you an LLM / coding agent?** Go to [`docs/LLM_INSTALL.md`](docs/LLM_INSTALL.md) for the full install checklist, pre-checks, mandatory user questions, and copy-paste commands. Human overview continues below.
 
@@ -187,7 +187,7 @@ the generated command when validating a new model family.
 
 ### EXL3 / FP8 native (buun) — `quant_method: exl3` + `-hf`
 
-Native safetensors via `buun-llama-cpp` (`spiritbuun/buun-llama-cpp c7f114d`, binary `buun/bin/llama-server-buun`, installed as optional engine `--optionals buun`). 91 quant types vs 43 mainline. Use `-hf` (not `--model` GGUF) and `server_overrides.engine: buun` with `quant_method: exl3`. Soporta EXL3 3.5bpw (EXL3_3/EXL3_4 mix) + FP8_BLOCK 128 + BF16.
+Native safetensors via `buun-llama-cpp` (`spiritbuun/buun-llama-cpp 8172dd1`, binary `buun/bin/llama-server-buun`, installed as optional engine `--optionals buun`). 91 quant types vs 43 mainline. Use `-hf` (not `--model` GGUF) and `server_overrides.engine: buun` with `quant_method: exl3`. Soporta EXL3 3.5bpw (EXL3_3/EXL3_4 mix) + FP8_BLOCK 128 + BF16.
 
 | Quant label | Buun loader | Notes |
 |---|---|---|

@@ -762,6 +762,7 @@ def _default_experimental_config() -> dict[str, object]:
         "affinity_policy": _default_affinity_policy_config(),
         "chat_tool_continue_repair": {"enabled": False, "max_rounds": 1, "max_tokens": 2048, "stream_keepalive_seconds": 15, "visible_notice_after_seconds": 4, "trigger_prefixes": ["[terminal command", "[terminal_inline", "</terminal_inline>", "Voy a", "Empezando por"], "prompt": "Your previous assistant message ended without any tool_calls.\nYou are in a tool-capable agent environment. If the next step requires reading files, editing files, running commands, searching, inspecting state, or using any external capability, you must call one of the available tools instead of describing the action in text.\nDo not answer with empty visible content. Do not answer with a sentence that only sets up an action and ends with a colon.\nAvailable tool names: {tool_names}.", "truncated_tool_call_prompt": "Your previous assistant message started a tool_call but it was truncated before the JSON arguments were complete.\nRetry now with exactly one complete, valid tool_call. Keep the arguments minimal and valid JSON. Do not stream or repeat partial arguments. Do not include explanatory text before the tool_call.\nAvailable tool names: {tool_names}.", "include_failed_assistant_message": False, "loop_guard": {"enabled": True, "no_tool_call_max_chars": 0, "repeated_tail_min_chars": 3000, "repeated_tail_repetitions": 4}},
         "chat_last_response_log": {"enabled": False, "path": "", "max_chars": 20000, "include_reasoning": False, "include_tool_calls": True},
+        "tool_intent_capture": {"enabled": False, "mode": "trigger", "path": "", "max_entries": 20, "max_chars": 8000000},
     }
 
 
@@ -841,6 +842,20 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                 rl["include_reasoning"] = _as_bool(rl.get("include_reasoning"), False)  # type: ignore
                 rl["include_tool_calls"] = _as_bool(rl.get("include_tool_calls"), True)  # type: ignore
                 cfg["chat_last_response_log"] = rl  # type: ignore
+            elif key == "tool_intent_capture" and isinstance(value, dict):
+                cap = dict(cfg["tool_intent_capture"])  # type: ignore
+                cap.update(value)  # type: ignore
+                cap["enabled"] = _as_bool(cap.get("enabled"), False)  # type: ignore
+                cap["mode"] = str(cap.get("mode") or "trigger").strip().lower()  # type: ignore
+                if cap["mode"] not in {"trigger", "all"}:  # type: ignore
+                    cap["mode"] = "trigger"  # type: ignore
+                cap["path"] = str(cap.get("path") or "").strip()  # type: ignore
+                for ck, dv in (("max_entries", 20), ("max_chars", 8000000)):
+                    try:
+                        cap[ck] = max(0, int(cap.get(ck, dv)))  # type: ignore
+                    except Exception:
+                        cap[ck] = dv  # type: ignore
+                cfg["tool_intent_capture"] = cap  # type: ignore
             elif key == "model_probe_autoload" and isinstance(value, dict):
                 normalized, _ = _normalize_model_probe_autoload_config(value)
                 cfg["model_probe_autoload"] = normalized
