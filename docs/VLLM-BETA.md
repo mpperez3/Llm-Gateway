@@ -270,6 +270,29 @@ Planned improvements for vLLM beta:
 
 > **Nota de migracion desde heimdall-gateway (deprecado):** `llm-server` es el nuevo comando canonico; `heimdall-gateway` sigue como alias deprecado con aviso en stderr. Migra automatica de rutas y env `HEIMDALL_GATEWAY_*` → `LLM_SERVER_*`.
 
+## Parches y knobs de rendimiento (2026-10)
+
+Inventario canónico, procedencia y reaplicación: **`llamacpp_stack/bundle/patches-vllm/README.md`**.
+Resumen:
+
+- **Aplicados (4, vLLM 0.32)**: `qwen35-embed-quant`, `qwen35-mtp-share-heads`,
+  `response-timings` (bloque `timings` en la respuesta, como llama.cpp) y
+  `slot-print-timing`. Se aplican con `tools/apply_vllm_patch.sh` y **hay que
+  re-ejecutarlo tras cada upgrade de vLLM**.
+- **Pendientes (receta 3090, vLLM 0.28.0)**: `spec-decode-attn` (split-KV verify),
+  `sampler-small-topk-fast-softmax`, `qwen3_5-mtp-draft-vocab` (+ vocab 40k desde
+  outputs), lm_head/MTP int4 GPTQ (`prepare/quant_*.py`), W4A8 Marlin (prefill),
+  `int4-kv-per-token-head`, y el drafter DFlash2 (no portado a 0.32).
+  Fuente: <https://github.com/xvus/syv-ai-qwen38-27b-rtx3090>.
+- **Knobs ya en catálogo**: `draft_sample_method: probabilistic` (importa con
+  `temperature > 0`), `mamba_cache_mode: align` (híbrido + prefix caching),
+  `enable_per_request_metrics` + `enable_force_include_usage` (timings por petición).
+
+Medición 2026-10-26 (2×4090 TP=2, 1,1k prompt, 256 gen, `temperature 0`, 5 reps):
+decode mediana **107 tok/s** (rango 103-117), prefill 1930 tok/s. A temp 0
+`probabilistic` y `greedy` empatan; `align` no cambia decode. Techo a batir de la
+receta en una 3090: 121 tok/s C1, con los pendientes 1-3 del inventario.
+
 ## References
 
 - [vLLM GitHub](https://github.com/vllm-project/vllm)
