@@ -25,6 +25,7 @@ fichero tocado. **Re-ejecutarlo tras cualquier upgrade de vLLM.**
 |---|---|---|
 | `vllm-0.32-qwen35-embed-quant.patch` | `model_executor/models/qwen3_5.py` | Respeta el `quant_config` del embedding (checkpoint AutoRound trae `embed_tokens` cuantizado; sin esto vLLM construye BF16 y falla al cargar). |
 | `vllm-0.32-qwen35-mtp-share-heads.patch` | `model_executor/models/qwen3_5_mtp.py` | El módulo MTP comparte `lm_head` con el target; sin esto el drafter no ve los pesos y la aceptación se hunde. |
+| `vllm-0.32-dflash2-lookup.patch` | `v1/worker/gpu/spec_decode/dflash2/{speculator,lookup}.py` + `v1/worker/gpu/model_runner.py` | **[port 0.32]** Lookup-augmented drafting (LABD): propone la continuación de una aparición previa del sufijo actual (copia exacta del contexto) y reescribe esos logits a masa puntual (rechazo exacto). `VLLM_DFLASH2_LOOKUP=0` lo desactiva. |
 | `vllm-0.32-qwen35-mtp-draft-vocab.patch` | `model_executor/models/qwen3_5_mtp.py` | **[port 0.32]** Head de draft truncado a 40 960 ids (`mtp.draft_lm_head.*` + `mtp_draft_vocab_ids.pt`); el resto de logits va a `-inf`. El rechazo sigue siendo exacto. Fuente: `patches/qwen3_5-mtp-draft-vocab.patch` de la receta. |
 | `vllm-0.32-response-timings.patch` | `entrypoints/openai/chat_completion/{protocol,serving}.py` | Añade el bloque `timings` (`prompt_n`, `prompt_per_second`, `predicted_n`, `predicted_per_second`) a la respuesta OpenAI, como llama.cpp. Lo leen `tools/bench_chat_timings.py` y llama-swap. |
 | `vllm-0.32-slot-print-timing.patch` | `v1/engine/output_processor.py` | Imprime el tiempo por slot en el log del motor (diagnóstico). |
@@ -47,7 +48,7 @@ y `docs/optimizations.md`.
 | 8 | `int4-kv-per-token-head.patch` | KV int4/int8 per-token-head (perfil CTX=long/huge de la receta). | Alternativa a `fp8` cuando se quiere más contexto. |
 | 9 | `xgrammar-spec-terminated.patch` | Cerrado de gramáticas con spec-decode (tool calls). | Toca xgrammar; revisar versión. |
 | 10 | `vision-tower-cpu-offload.patch` | Descarga el vision tower a CPU cuando no se usa (ahorra ~0,9 GiB de VRAM). | Solo si volvemos a `--language-model-only`. |
-| ~~—~~ | ~~`dflash2-*.patch`~~ ✅ **nativo en 0.32** | Drafter DFlash2: 7 drafts en un pase. Medido aquí: **127,1 tok/s C1** (vs 116,5 con MTP) y 132,6 en tarea de citar a 27k. | vLLM 0.32 trae `qwen3_dflash2.py` + `DFlashProposer`; solo hay que bajar el drafter. Los parches `dflash2-*.patch` de la receta (lookup, ngram chains) siguen sin portar: sin ellos no se llega a sus 381 en citas largas. |
+| ~~—~~ | ~~`dflash2-*.patch`~~ ✅ **nativo en 0.32** (lookup ✅ portado; ngram-chains/adaptive-emitted pendientes) | Drafter DFlash2: 7 drafts en un pase. Medido aquí: **127,1 tok/s C1** (vs 116,5 con MTP) y 132,6 en tarea de citar a 27k. | vLLM 0.32 trae `qwen3_dflash2.py` + `DFlashProposer`; solo hay que bajar el drafter. Los parches `dflash2-*.patch` de la receta (lookup, ngram chains) siguen sin portar: sin ellos no se llega a sus 381 en citas largas. |
 
 ## Pipeline de prepare de la receta (pendiente)
 
@@ -143,6 +144,30 @@ EOF
   (DFlash2 consume los hidden states del target, no tiene KV propio).
 - Revertir a MTP: `{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}`
   (el draft vocab 40 960 sigue en el modelo y se reutiliza).
+
+### Lookup drafting (LABD) — aplicado
+
+Portado de `patches/dflash2-lookup-drafting.patch` (1.073 líneas) al speculator de
+0.32: `suffix_lookup` (encuentra la ocurrencia más reciente del sufijo en el
+historial del request), `fuse_draft` (funde la propuesta con la del drafter; cabeza
+con umbral `nstrong`/acuerdo y cola libre) y `_point_mass_draft_logits` (q = masa
+puntual, rechazo exacto). Buffers y llamada en `DFlash2Speculator`, `set_req_states`
+desde el model runner.
+
+Knobs (env del motor): `VLLM_DFLASH2_LOOKUP=0` off; `..._NMIN` (6), `..._NSTRONG` (8),
+`..._AGREE` (2), `..._NMAX` (32).
+
+| Prueba | sin lookup | con lookup |
+|---|---|---|
+| Copiar un pasaje corto (142 prompt) | — | **205,1 tok/s, salida idéntica** |
+| Citar 27k (`--task quote`) | 132,6 | **193,6-201,6** (+46-52 %) |
+| Resumen C1 (prosa) | 117,7-154,8 (med 127,1) | 108,5-141,2 (med 115,8) |
+
+Coste en prosa: 0-9 % (su receta reporta 3-20 % en contexto largo mixto); el
+bloque largo solo se propone cuando el lookup acierta. Con 0.32 seguimos limitados
+a `num_speculative_tokens=7` (el drafter está entrenado para 8 posiciones); sus 381
+usan bloque de 15, que requiere separar `draft_block` (7) del bloque de verify — el
+siguiente paso si se quiere exprimir más.
 
 ### Medición
 
