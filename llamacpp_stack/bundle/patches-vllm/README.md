@@ -145,7 +145,51 @@ EOF
 - Revertir a MTP: `{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}`
   (el draft vocab 40 960 sigue en el modelo y se reutiliza).
 
-### Lookup drafting (LABD) — aplicado
+### Prefix cache y mensajes system inline (aplicado 2026-10-26)
+
+**Síntoma**: los clientes agénticos (Claude Code y similares) ven peticiones
+lentas aunque el decode vaya a >100 tok/s. Los logs de vLLM lo dicen:
+
+```
+The chat template requires system-first ordering, so inline system messages in
+/v1/messages requests (e.g. Claude Code's per-turn reminders) are merged into the
+leading system prompt. Each new one changes the prompt prefix, so the rest of the
+conversation misses the prefix cache.
+```
+
+**Causa**: la plantilla de Qwen3.8 lanza `System message must be at the beginning`
+para cualquier system que no sea el primero. vLLM lo detecta
+(`_detect_merge_inline_system`) y **fusiona** los recordatorios inline en el system
+inicial; como cambian en cada turno, el prefijo entero cambia y el prefix cache
+nunca acierta. Además, por `/v1/chat/completions` esos mensajes devolvían **400**.
+
+**Fix**: plantilla con el guard substituido por un render en su sitio (como turno
+`user`): `llamacpp_stack/bundle/vllm/qwen38_chat_template_inline_system.jinja`.
+Se pasa al motor con `chat_template` en `server_overrides.vllm`:
+
+```json
+"chat_template": "/path/to/qwen38_chat_template_inline_system.jinja"
+```
+
+**Medido** (2×4090, 23.8k de prefijo, recordatorio distinto en cada turno):
+
+| | antes | después |
+|---|---|---|
+| turno 1 (frío) | 11,6 s | 11,6 s |
+| turno 2 | ~11,6 s (sin cache) | **5,4 s** |
+| turno 3 | ~11,6 s | **2,2 s** |
+
+`/v1/chat/completions` con system inline pasa de 400 a 200.
+
+Notas sobre el prefix cache en este modelo:
+- Granularidad de **1728 tokens** (page de mamba/atención alineada): prompts
+  cortos no aciertan aunque se repitan.
+- `GPU KV cache usage: 0.0%` entre peticiones es normal (no hay requests activos);
+  bajo carga se ve 20-60 %.
+- En tráfico real el hit rate estaba en 0 % justo tras reiniciar el motor y subía
+  al repetirse prefijos (76-79 % con clientes agénticos antes del fix).
+
+## Lookup drafting (LABD) — aplicado
 
 Portado de `patches/dflash2-lookup-drafting.patch` (1.073 líneas) al speculator de
 0.32: `suffix_lookup` (encuentra la ocurrencia más reciente del sufijo en el

@@ -307,6 +307,17 @@ configura con `method: dflash`. Cuesta ~30 % del pool de KV (1,71× en vez de 2,
 a 262k) y da +9 % en C1. Sin los parches de lookup de la receta no llegamos a sus
 381 tok/s citando contexto (aquí 132,6 a 27k).
 
+## Prefix cache con clientes agénticos (2026-10-26)
+
+La plantilla de Qwen3.8 exige system-first; vLLM fusionaba los recordatorios
+inline de Claude Code en el system inicial, cambiando el prefijo en cada turno y
+anulando el prefix cache (y devolvía 400 en `/v1/chat/completions`). Se pasa una
+plantilla propia que renderiza los system no iniciales en su sitio
+(`llamacpp_stack/bundle/vllm/qwen38_chat_template_inline_system.jinja`, knob
+`chat_template`). Medido con 23.8k de prefijo: 11,6 s → 5,4 s → 2,2 s por turno.
+El cache tiene granularidad de 1728 tokens; el 0 % de KV entre peticiones es
+normal (no hay requests activos).
+
 ## References
 
 - [vLLM GitHub](https://github.com/vllm-project/vllm)

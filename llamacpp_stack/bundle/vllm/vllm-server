@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# vLLM entrypoint for the gateway (portable; created by the deploy).
+set -euo pipefail
+set -a
+source "$HOME/.config/llm-server/llm-server.env"
+set +a
+PYTHON_BIN="${PYTHON_BIN:-$HOME/.local/opt/llm-server/venv/bin/python}"
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+# FlashInfer's JIT sampler is incompatible with the local CUDA/CUB toolchain on
+# Ada (sm_89). Keep the other kernels and use vLLM's native sampler.
+export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+export PATH="$(dirname "$PYTHON_BIN"):${PATH:-}"
+
+# The gateway's bundled CUDA ships nvcc 13.4 with 13.2 headers, which fails
+# FlashInfer's CUDA-toolkit version check at JIT time. Prefer a consistent
+# system toolkit (13.3: nvcc and headers match; minor-version ABI-compatible
+# with torch cu132).
+if [ -x /usr/local/cuda-13.3/bin/nvcc ]; then
+    export CUDA_HOME=/usr/local/cuda-13.3
+    export CUDA_PATH=/usr/local/cuda-13.3
+    export PATH="/usr/local/cuda-13.3/bin:${PATH}"
+    export LD_LIBRARY_PATH="/usr/local/cuda-13.3/lib64:${LD_LIBRARY_PATH:-}"
+fi
+
+# The renderer emits native vLLM arguments; translate the small legacy
+# llama.cpp surface used by older catalog entries.
+translated=(--no-enable-log-requests)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --ctx-size) translated+=(--max-model-len "$2"); shift 2 ;;
+        --f16|--float16) translated+=(--dtype float16); shift ;;
+        --f32|--float32) translated+=(--dtype float32); shift ;;
+        --bf16|--bfloat16) translated+=(--dtype bfloat16); shift ;;
+        --n-gpu-layers|-ngl|--fit|--fitc|--fitt|-fitc|-fitt|-fit|--threads|--threads-batch|--mirostat|--mirostat-ent|--mirostat-lr|--cache-type-k|--cache-type-v|--keep|--draft|--spec-draft-n-max)
+            shift 2 ;;
+        --mmap|--mlock|--no-mmap|--no-mlock) shift ;;
+        *) translated+=("$1"); shift ;;
+    esac
+done
+exec "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server "${translated[@]}"
