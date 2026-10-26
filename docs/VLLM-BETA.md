@@ -298,7 +298,9 @@ Medición 2026-10-26 (2×4090 TP=2, 1,1k prompt, 256 gen, `temperature 0`, 5 rep
 **DFlash2 d7: 127,1 tok/s** de mediana (117,7-154,8) frente a 116,5 con MTP d3 + draft
 vocab y 107,1 sin vocab; prefill ~1900-1975. Con **lookup drafting** (portado de la
 receta) las tareas de copia/cita suben a **194-205 tok/s** (+46-52 % sobre 132,6) con
-salida byte-idéntica, a cambio de 0-9 % en prosa. A temp 0 `probabilistic` y `greedy`
+salida byte-idéntica, a cambio de 0-9 % en prosa. Con bloque de verify 15 (modo copia,
+opt-in) la cita sube a **259 tok/s** pero la prosa baja a 94 (-19 %): el default es 7.
+El controlador adaptativo de la receta (`next_num_draft_tokens`) no está portado. A temp 0 `probabilistic` y `greedy`
 empatan y `align` no cambia decode. DFlash2 **sí existe en vLLM 0.32**
 (`qwen3_dflash2` + `DFlashProposer`): se baja el drafter W4A16 de 1,2 GB y se
 configura con `method: dflash`. Cuesta ~30 % del pool de KV (1,71× en vez de 2,46×

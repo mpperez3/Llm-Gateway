@@ -163,11 +163,31 @@ Knobs (env del motor): `VLLM_DFLASH2_LOOKUP=0` off; `..._NMIN` (6), `..._NSTRONG
 | Citar 27k (`--task quote`) | 132,6 | **193,6-201,6** (+46-52 %) |
 | Resumen C1 (prosa) | 117,7-154,8 (med 127,1) | 108,5-141,2 (med 115,8) |
 
-Coste en prosa: 0-9 % (su receta reporta 3-20 % en contexto largo mixto); el
-bloque largo solo se propone cuando el lookup acierta. Con 0.32 seguimos limitados
-a `num_speculative_tokens=7` (el drafter está entrenado para 8 posiciones); sus 381
-usan bloque de 15, que requiere separar `draft_block` (7) del bloque de verify — el
-siguiente paso si se quiere exprimir más.
+Coste en prosa: 0-9 % (su receta reporta 3-20 % en contexto largo mixto).
+
+### Bloque 15 (modo copia, opt-in)
+
+El port incluye el desacople `draft_block` (7, lo que el checkpoint sabe hacer) del
+bloque de verify, así que `num_speculative_tokens: 15` funciona: el drafter emite 7
+y el lookup rellena 7..14.
+
+| | k=7 (default) | k=15 |
+|---|---|---|
+| Citar 27k | 193-202 | **259** (+28-34 %) |
+| Prosa C1 | 105-127 | **94** (-19 %) |
+
+El coste en prosa es fijo porque no portamos el controlador adaptativo de la receta
+(`next_num_draft_tokens`, decide bloque largo solo mientras la copia está en marcha):
+sin él, se verifican 16 tokens en cada paso. Por eso el default sigue en **k=7**.
+Para activar el modo copia en `catalog.json` → `server_overrides.vllm`:
+
+```json
+"speculative_config": {"method": "dflash", "model": ".../DFlash2-W4A16",
+                       "num_speculative_tokens": 15, "draft_sample_method": "probabilistic"},
+"max_cudagraph_capture_size": 64
+```
+
+y `llm-server update` (recarga el modelo).
 
 ### Medición
 
