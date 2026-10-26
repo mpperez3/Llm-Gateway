@@ -25,6 +25,7 @@ fichero tocado. **Re-ejecutarlo tras cualquier upgrade de vLLM.**
 |---|---|---|
 | `vllm-0.32-qwen35-embed-quant.patch` | `model_executor/models/qwen3_5.py` | Respeta el `quant_config` del embedding (checkpoint AutoRound trae `embed_tokens` cuantizado; sin esto vLLM construye BF16 y falla al cargar). |
 | `vllm-0.32-qwen35-mtp-share-heads.patch` | `model_executor/models/qwen3_5_mtp.py` | El módulo MTP comparte `lm_head` con el target; sin esto el drafter no ve los pesos y la aceptación se hunde. |
+| `vllm-0.32-qwen35-mtp-draft-vocab.patch` | `model_executor/models/qwen3_5_mtp.py` | **[port 0.32]** Head de draft truncado a 40 960 ids (`mtp.draft_lm_head.*` + `mtp_draft_vocab_ids.pt`); el resto de logits va a `-inf`. El rechazo sigue siendo exacto. Fuente: `patches/qwen3_5-mtp-draft-vocab.patch` de la receta. |
 | `vllm-0.32-response-timings.patch` | `entrypoints/openai/chat_completion/{protocol,serving}.py` | Añade el bloque `timings` (`prompt_n`, `prompt_per_second`, `predicted_n`, `predicted_per_second`) a la respuesta OpenAI, como llama.cpp. Lo leen `tools/bench_chat_timings.py` y llama-swap. |
 | `vllm-0.32-slot-print-timing.patch` | `v1/engine/output_processor.py` | Imprime el tiempo por slot en el log del motor (diagnóstico). |
 
@@ -38,7 +39,7 @@ y `docs/optimizations.md`.
 |---|---|---|---|
 | 1 | `spec-decode-attn.patch` | Split-KV attention para el verify multi-query (5 queries): FA2 deja 58 de 82 SMs ociosos. Con `VLLM_SPEC_DECODE_ATTN=1`; solo KV bf16. | Toca el path de spec-decode attention; validar contra el backend FLASH_ATTN de 0.32. |
 | 2 | `sampler-small-topk-fast-softmax.patch` | Top-k sin sort + softmax multi-bloque; drafts truncados al top-k/top-p del target. | Sampler reescrito en 0.32; probable rebase manual. |
-| 3 | `qwen3_5-mtp-draft-vocab.patch` | Vocabulario de draft recortado (40k) para el MTP. Con `prepare/build_draft_vocab.py` (ids contados sobre outputs del propio modelo: 97,5 % de cobertura vs 92 % de un vocab web). | Depende de que el MTP acepte `draft_vocab_size`/ids; comprobar firma en 0.32. |
+| ~~3~~ | ~~`qwen3_5-mtp-draft-vocab.patch`~~ ✅ **aplicado** | Vocab de draft 40 960 ids (ver abajo). | Portado a 0.32 (ver fila en Aplicados). |
 | 4 | `speed-knobs-envs.patch` | Env knobs de la receta (`VLLM_SPEC_DECODE_ATTN`, `VLLM_PREFILL_ATTN`, ...). | Cosmético si no se usan esos envs. |
 | 5 | `hybrid-kv-groups-v2-cudagraph.patch` | Evita que las 5 capas sliding-window del drafter padeen las capas attention/GDN del target (78 vs 105 KB/token de pool). | Solo relevante con drafter externo; verificar con `--mamba-cache-mode align`. |
 | 6 | `marlin-int8-layer-select.patch`, `marlin-int8-negative-scales.patch`, `marlin-tune-table.patch`, `marlin-repack-staged-sm80.patch` | W4A8: activaciones int8 por token sobre Marlin → +29 % prefill. Env `VLLM_MARLIN_INPUT_DTYPE=int8`, `VLLM_MARLIN_INT8_INCLUDE_RE=mlp\|linear_attn\|self_attn`. | Parches de kernels; alto riesgo de conflicto con 0.32. |
@@ -75,6 +76,26 @@ Ya estaban: `kv_cache_dtype fp8`, MTP `num_speculative_tokens 3`, `enable_prefix
 `max_cudagraph_capture_size 16`, `max_num_seqs 2`, `max_num_batched_tokens 1024`,
 `limit_mm_per_prompt {image:2,video:0}` (visión).
 
+## Draft vocab aplicado (2026-10-26)
+
+```bash
+# 1. backup del índice y de los extras del modelo (el script también hace su .bak-draft)
+cp -a "$MODEL/model.safetensors.index.json" "$MODEL/model.safetensors.index.json.bak-draftvocab"
+cp -a "$MODEL/model_extra_tensors.safetensors" "$MODEL/model_extra_tensors.safetensors.bak-draftvocab"
+# 2. construir el head truncado (213 MB en este checkpoint int8: 40 960 x 1 280 int32)
+python tools/build_draft_vocab.py "$MODEL" --ids tools/draft_vocab_ids.json
+# 3. reiniciar el router (recarga vLLM); el log debe decir:
+#    "MTP drafter uses a 40960-token draft head"
+```
+
+- `tools/build_draft_vocab.py` y `tools/draft_vocab_ids.json` son copias vendorizadas
+  de `prepare/` de la receta (ids contados sobre danés/inglés/código + outputs;
+  cobertura held-out ~95 %). Para dominios propios, regenerar con `--n 40960 --corpus f1 f2 ...`.
+- Aviso benigno en el log: las escalas del head se guardan fp16 y vLLM las carga en
+  bf16 (`Attempted to load weight draft_lm_head.weight_scale with dtype torch.float16
+  into parameter with dtype torch.bfloat16`); los valores son correctos.
+- Desactivar: `MTP_DRAFT_VOCAB=0` en el entorno del motor.
+
 ## Medición (2026-10-26, 2×4090, TP=2, 1,1k prompt, 256 gen, `temperature 0`)
 
 | Config | decode mediana (5 reps) | prefill |
@@ -82,6 +103,7 @@ Ya estaban: `kv_cache_dtype fp8`, MTP `num_speculative_tokens 3`, `enable_prefix
 | `greedy` + `align` | 107,5 tok/s | 1930 |
 | `probabilistic` + `align` | 107,1 tok/s | 1930 |
 | `probabilistic` sin `align` | 107,3 tok/s | 1930 |
+| `probabilistic` + `align` + **draft vocab 40 960** | **120,4 tok/s** | 1960 |
 
 - A `temperature 0` los drafts argmax y muestreados coinciden → **sin diferencia**
   (la ganancia de `probabilistic` aparece con temperatura > 0).

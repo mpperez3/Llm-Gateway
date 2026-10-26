@@ -275,10 +275,12 @@ Planned improvements for vLLM beta:
 Inventario canónico, procedencia y reaplicación: **`llamacpp_stack/bundle/patches-vllm/README.md`**.
 Resumen:
 
-- **Aplicados (4, vLLM 0.32)**: `qwen35-embed-quant`, `qwen35-mtp-share-heads`,
-  `response-timings` (bloque `timings` en la respuesta, como llama.cpp) y
-  `slot-print-timing`. Se aplican con `tools/apply_vllm_patch.sh` y **hay que
-  re-ejecutarlo tras cada upgrade de vLLM**.
+- **Aplicados (5, vLLM 0.32)**: `qwen35-embed-quant`, `qwen35-mtp-share-heads`,
+  `response-timings` (bloque `timings` en la respuesta, como llama.cpp),
+  `slot-print-timing` y `qwen35-mtp-draft-vocab` (head de draft truncado a 40 960
+  ids; +12 % de decode medido). Se aplican con `tools/apply_vllm_patch.sh` y **hay
+  que re-ejecutarlo tras cada upgrade de vLLM**. El vocab se genera por modelo con
+  `tools/build_draft_vocab.py <model_dir> --ids tools/draft_vocab_ids.json`.
 - **Pendientes (receta 3090, vLLM 0.28.0)**: `spec-decode-attn` (split-KV verify),
   `sampler-small-topk-fast-softmax`, `qwen3_5-mtp-draft-vocab` (+ vocab 40k desde
   outputs), lm_head/MTP int4 GPTQ (`prepare/quant_*.py`), W4A8 Marlin (prefill),
@@ -289,9 +291,11 @@ Resumen:
   `enable_per_request_metrics` + `enable_force_include_usage` (timings por petición).
 
 Medición 2026-10-26 (2×4090 TP=2, 1,1k prompt, 256 gen, `temperature 0`, 5 reps):
-decode mediana **107 tok/s** (rango 103-117), prefill 1930 tok/s. A temp 0
-`probabilistic` y `greedy` empatan; `align` no cambia decode. Techo a batir de la
-receta en una 3090: 121 tok/s C1, con los pendientes 1-3 del inventario.
+decode mediana **120,4 tok/s** (rango 115-127) con el draft vocab, frente a 107,1
+sin él (+12 %); prefill ~1960 tok/s. A temp 0 `probabilistic` y `greedy` empatan y
+`align` no cambia decode. Ya estamos en el C1 de la receta en una 3090 (121 tok/s);
+el resto de su ventaja es el drafter DFlash2 (no portado a 0.32) y el lm_head/MTP
+int4.
 
 ## References
 
