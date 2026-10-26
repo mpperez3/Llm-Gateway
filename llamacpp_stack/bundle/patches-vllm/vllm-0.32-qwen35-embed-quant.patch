@@ -1,0 +1,28 @@
+vLLM 0.32.0: let Qwen3.5 use a quantized (int8) token embedding
+
+vLLM ships CompressedTensorsEmbeddingWNA16Int (dequant-on-gather), but the
+qwen3_5 model code never passes quant_config to VocabParallelEmbedding, so a
+checkpoint whose embed_tokens is int8 group-128 loads the dense copy instead
+(and the pack-quantized tensors go unused). Same two-line idea as the upstream
+syv-ai patch; here only the target model needs it because the MTP drafter
+shares the target embedding (see the share-heads patch).
+
+Pairs with tools/quantize_token_tables.py. Apply from site-packages: patch -p1
+
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -248,9 +248,14 @@
+ 
+         self.vocab_size = config.vocab_size
+ 
++        # Route the token table through vLLM's quantized-embedding path when the
++        # checkpoint quantizes it (int8 group-128). Without quant_config the
++        # loader keeps the bf16 copy and the int8 savings are lost.
+         self.embed_tokens = VocabParallelEmbedding(
+             self.vocab_size,
+             config.hidden_size,
++            quant_config=self.quant_config,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
+         )
+ 
+         def get_layer(prefix: str):

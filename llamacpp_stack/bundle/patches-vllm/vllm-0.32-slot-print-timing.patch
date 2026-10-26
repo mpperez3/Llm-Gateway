@@ -1,0 +1,94 @@
+vLLM 0.32.0: emit llama.cpp-style `slot print_timing` for llama-swap
+
+llama-swap's model dashboard derives Prefill/Decode from the upstream log's
+`slot print_timing` lines. vLLM never emits them, so the panel stays empty for
+vLLM models (see README 'Metrics per backend'). This hook logs one pair of lines
+per finished request from RequestStateStats (first_token_ts / scheduled_ts /
+last_token_ts), which covers both streaming and non-streaming requests.
+
+Format matches llama.cpp / exllama_server.py exactly so the llama-swap parser
+recognises it.
+
+Apply from site-packages: patch -p1 < this-file
+Revert:                  patch -R -p1 < this-file
+
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import asyncio
++import itertools
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+ from dataclasses import dataclass
+@@ -29,6 +30,7 @@
+     extract_trace_context,
+     instrument_manual,
+ )
++from vllm.logger import init_logger
+ from vllm.utils import length_from_prompt_token_ids_or_embeds
+ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+ from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+@@ -43,6 +45,43 @@
+ )
+ from vllm.v1.outputs import SamplingMaskLists
+ 
++logger = init_logger(__name__)
++_TQ_TASK_COUNTER = itertools.count(1)
++
++
++def _tq_log_print_timing(out) -> None:
++    """Emit llama.cpp-compatible `slot print_timing` lines for llama-swap.
++
++    llama-swap's dashboard reads Prefill/Decode from those log lines; vLLM does not
++    emit them natively, so the panel stays empty. Called once per finished
++    RequestOutput (covers streaming and non-streaming).
++    """
++    try:
++        if not getattr(out, "finished", False):
++            return
++        st = getattr(out, "metrics", None)
++        if st is None:
++            return
++        gen_n = int(getattr(st, "num_generation_tokens", 0) or 0)
++        pids = getattr(out, "prompt_token_ids", None)
++        prompt_n = len(pids) if pids else 0
++        ft = float(getattr(st, "first_token_ts", 0.0) or 0.0)
++        sched = float(getattr(st, "scheduled_ts", 0.0) or 0.0)
++        lt = float(getattr(st, "last_token_ts", 0.0) or 0.0)
++        if gen_n <= 0 or prompt_n <= 0 or ft <= 0.0 or lt <= 0.0:
++            return
++        prefill_ms = max(0.0, (ft - sched) * 1000.0)
++        decode_ms = max(0.0, (lt - ft) * 1000.0)
++        p_ms = (prefill_ms / prompt_n) if prefill_ms > 0 else 0.0
++        p_tps = (prompt_n / (prefill_ms / 1000.0)) if prefill_ms > 0 else 0.0
++        e_ms = (decode_ms / gen_n) if decode_ms > 0 else 0.0
++        e_tps = (gen_n / (decode_ms / 1000.0)) if decode_ms > 0 else 0.0
++        task = next(_TQ_TASK_COUNTER)
++        logger.info("slot print_timing: id  0 | task %4d | prompt eval time = %8.2f ms / %5d tokens (%6.2f ms per token, %8.2f tokens per second)", task, prefill_ms, prompt_n, p_ms, p_tps)
++        logger.info("slot print_timing: id  0 | task %4d |        eval time = %8.2f ms / %5d tokens (%6.2f ms per token, %8.2f tokens per second)", task, decode_ms, gen_n, e_ms, e_tps)
++    except Exception:
++        pass
++
+ if TYPE_CHECKING:
+     from vllm.v1.engine.admission_control import SharedAdmissionStats
+ 
+@@ -409,7 +448,7 @@
+             prompt_logprobs = self.logprobs_processor.prompt_logprobs
+             prompt_token_id_logprobs = self.logprobs_processor.prompt_token_id_logprobs
+ 
+-        return RequestOutput(
++        _out = RequestOutput(
+             request_id=external_req_id,  # request_id is what was provided externally
+             lora_request=self.lora_request,
+             prompt=self.prompt,
+@@ -424,6 +463,8 @@
+             num_cache_creation_tokens=self.num_cache_creation_tokens,
+             metrics=self.stats,
+         )
++        _tq_log_print_timing(_out)
++        return _out
+ 
+     def _new_completion_output(
+         self,

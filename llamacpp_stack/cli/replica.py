@@ -1173,7 +1173,7 @@ def render_llamaswap_config(
             "checkEndpoint": "/health",
             "ttl": int(idle_ttl),
         }
-        entry["capabilities"] = route_capabilities(entry)
+        entry["capabilities"] = route_capabilities(entry, m)
         data["models"][m.model_id] = entry
         if public_base_model_id is not None:
             data["models"][m.model_id]["metadata"] = {"internal_replica_of": public_base_model_id}
@@ -1189,7 +1189,7 @@ def render_llamaswap_config(
                     "checkEndpoint": "/health",
                     "ttl": int(idle_ttl),
                 }
-                variant_entry["capabilities"] = route_capabilities(variant_entry)
+                variant_entry["capabilities"] = route_capabilities(variant_entry, m)
                 variant_entry["metadata"] = {
                     "route_variant_of": m.model_id,
                     "gpu_variant": variant_gpus[0],
@@ -1290,7 +1290,7 @@ def route_carries_mmproj(entry: object) -> bool:
         return False
 
 
-def route_capabilities(entry: object) -> dict[str, object]:
+def route_capabilities(entry: object, model: object | None = None) -> dict[str, object]:
     """llama-swap listing capabilities for a rendered route entry.
 
     llama-swap publishes this through ``/v1/models`` and badges it in the v255
@@ -1299,6 +1299,18 @@ def route_capabilities(entry: object) -> dict[str, object]:
     instance and ``vision: true`` only on the one that actually carries it.
     Listing metadata only: llama-swap never routes on it.
     """
+    cmd = str((entry or {}).get("cmd") or "")
+    if "--limit-mm-per-prompt" in cmd:
+        # vLLM renders this flag when the catalog grants image/video input;
+        # the vision tower lives in the checkpoint, so no --mmproj is present.
+        return {"vision": True}
+    try:
+        if str(getattr(model, "backend", "") or "").strip().lower() == "vllm":
+            caps = [str(c).lower() for c in (getattr(model, "load_capabilities", None) or [])]
+            if any("image" in cap for cap in caps):
+                return {"vision": True}
+    except Exception:
+        pass
     return {"vision": route_carries_mmproj(entry)}
 
 
@@ -1384,7 +1396,7 @@ def ensure_internal_route_in_llamaswap_config(
             "metadata": dict(metadata or {"internal_replica_of": base_model.model_id}),
             "description": description or getattr(model_for_route, "description", "") or route_id,
         }
-        entry["capabilities"] = route_capabilities(entry)
+        entry["capabilities"] = route_capabilities(entry, model_for_route)
 
         # Subset compare over every field this function owns. Comparing only the
         # mmproj state would silently drop a CVD-only or ttl-only edit.

@@ -1141,7 +1141,7 @@ class OpenAIChatCompletionsRouteSwitchWiringTest(_HandlerRouteSwitchMixin, unitt
             body,
         )
         self.assertIn(
-            "if _messages_include_images(messages) and (model_entry is None or not _has_configured_mmproj_runtime(model_entry)):",
+            "if _messages_include_images(messages) and (model_entry is None or not (_has_configured_mmproj_runtime(model_entry) or _model_is_vllm_multimodal(model_entry))):",
             body,
         )
 

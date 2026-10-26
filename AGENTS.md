@@ -315,6 +315,7 @@ Ver `README.md#Troubleshooting` y `docs/LLM_INSTALL.md#8`.
 - `llamacpp_stack/install.py` — fuente de verdad de prompts/flags (`prompt_bool`, `prompt_choice`, `resolve_*`, `build_cli_parser`).
 - `docs/DFLASH-SPEC.md` — MTP vs DFlash2: presupuesto de VRAM medido, trampa `ctx_size_draft:0`, coste de `--logits-all`, compat EXL3+DFlash2, patch requerido, y **la nota de que el servicio corre un snapshot (§8)**.
 - `docs/kv-cache-reuse-hybrid-qwen35.md` — por qué un turno que añade ~3k tokens reprocesa ~30k: `preserve_thinking=false` + plantilla posicional de Qwen3.5, checkpoints de modelo híbrido (reuse = último checkpoint ≤ LCP), captura/diff (`tools/compare_prompt_captures.py`) y palancas.
+- `docs/PERF-BASELINE-4090-QWEN38-27B.md` — baseline medido en esta máquina (264K: 1272 prefill / 57-58 decode), efecto del driver 615, barrido de codecs KV (turbo4 vs turbo8/f16/q8_0), VBR a 264K, A/B buun vs exllamav3, negativos (threads/CCD, draft tuning) y **protocolo de medición** (parar servicios, nonce por request, timings del servidor, seed fijo para drafts). Cliente: `tools/bench_chat_timings.py`.
 - `docs/VLLM-BETA.md`, `docs/LOCAL_OLLAMA_SETUP.md`, `docs/arg-hyphen-conventions.md`, `docs/flags_llamacpp`, `docs/lllamacpp_flags_API.md`.
 - `skills/llm-server-autotune/SKILL.md` — loop de autotuning.
 

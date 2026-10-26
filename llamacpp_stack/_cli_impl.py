@@ -2080,6 +2080,16 @@ def normalize_server_config_payload(payload: dict[str, object]) -> tuple[dict[st
     norm_logging["llama_swap"] = norm_ls
     if ls_changed:
         changed = True
+    try:
+        from llamacpp_stack.cli.draft_vocab import normalize_config as _live_dv_norm  # type: ignore
+
+        raw_dv = raw_logging.get("draft_vocab") if isinstance(raw_logging, dict) else None
+        norm_dv = _live_dv_norm(raw_dv)
+        if norm_logging.get("draft_vocab") != norm_dv:
+            norm_logging["draft_vocab"] = norm_dv
+            changed = True
+    except Exception:
+        pass
     if norm_logging != result.get("logging"):
         result["logging"] = norm_logging
         changed = True
@@ -6569,6 +6579,73 @@ def catalog_key_warnings(path: Path) -> list[str]:
                     f"Use snake_case top-level keys; raw llama.cpp flags belong under server_overrides."
                 )
     return warnings
+
+
+_DRAFT_VOCAB_CFG_CACHE: dict[str, object] = {"at": 0.0, "cfg": None}
+
+
+def _draft_vocab_cfg(args) -> dict:
+    """Cached normalized ``logging.draft_vocab`` block (30 s TTL)."""
+    now = time.monotonic()
+    cached = _DRAFT_VOCAB_CFG_CACHE
+    cfg = cached.get("cfg")
+    if isinstance(cfg, dict) and (now - float(cached.get("at") or 0.0)) < 30.0:
+        return cfg
+    raw = None
+    try:
+        raw = (_load_server_config_payload(args).get("logging") or {}).get("draft_vocab")
+    except Exception:
+        raw = None
+    try:
+        from llamacpp_stack.cli.draft_vocab import normalize_config as _norm
+
+        cfg = _norm(raw)
+    except Exception:
+        cfg = {"enabled": False}
+    cached["cfg"] = cfg
+    cached["at"] = now
+    return cfg
+
+
+def _draft_vocab_tokenizer_path(catalog, model_name: str) -> str | None:
+    """``<model local_path>/tokenizer.json`` for the model serving this request."""
+    try:
+        for model in catalog or []:
+            ids = [getattr(model, "model_id", "")] + list(getattr(model, "aliases", None) or [])
+            if model_name in ids:
+                local = str(getattr(model, "local_path", "") or "").strip()
+                if not local:
+                    return None
+                path = Path(local)
+                base = path if path.is_dir() else path.parent
+                candidate = base / "tokenizer.json"
+                return str(candidate) if candidate.is_file() else None
+    except Exception:
+        return None
+    return None
+
+
+def _capture_draft_vocab(args, catalog, model_name: str, texts) -> None:
+    """Feed one completed response to the sampled draft-vocabulary collector.
+
+    Fail-open by design: any problem here must never affect the response.
+    """
+    try:
+        cfg = _draft_vocab_cfg(args)
+        if not cfg.get("enabled"):
+            return
+        from llamacpp_stack.cli.draft_vocab import get_collector
+
+        collector = get_collector(cfg, DEFAULT_REQUESTS_LOG_PATH.parent)
+        if collector is None:
+            return
+        collector.note_request()
+        if not collector.should_sample():
+            return
+        # enqueue() is O(1): tokenization happens on the collector's worker thread.
+        collector.enqueue(model_name, _draft_vocab_tokenizer_path(catalog, model_name), list(texts))
+    except Exception:
+        pass
 
 
 def print_config_keys(args) -> int:
@@ -12294,6 +12371,18 @@ def _has_configured_mmproj_runtime(model: ManagedModel) -> bool:
     return bool(model.mmproj_path and Path(model.mmproj_path).exists())
 
 
+def _model_is_vllm_multimodal(model) -> bool:
+    """True for vLLM models: the vision tower ships inside the checkpoint.
+
+    vLLM needs no mmproj file, so the llama.cpp-style "no projector" gate must not
+    reject image requests for backend=vllm (see docs §25).
+    """
+    try:
+        return str(getattr(model, "backend", "") or "").strip().lower() == "vllm"
+    except Exception:
+        return False
+
+
 def _cmdline_mmproj_path(cmdline: str) -> str | None:
     try:
         argv = shlex.split(str(cmdline or ""))
@@ -16778,6 +16867,22 @@ def _is_loopback_client(host: str) -> bool:
         return False
 
 
+MAINTENANCE_FLAG_PATH = DEFAULT_REQUESTS_LOG_PATH.with_name("maintenance")
+
+
+def _maintenance_flag_active() -> bool:
+    """Maintenance mode is toggled at runtime by touching <state>/maintenance.
+
+    While the flag exists the gateway answers 503 to every non-loopback client and
+    keeps serving localhost, so benchmarks can run through the real API without
+    mixing in client traffic.
+    """
+    try:
+        return MAINTENANCE_FLAG_PATH.exists()
+    except Exception:
+        return False
+
+
 def _make_tls_context(https_cfg: dict[str, object]) -> ssl.SSLContext:
     cert_file = str(https_cfg.get("cert_file") or "").strip()
     key_file = str(https_cfg.get("key_file") or "").strip()
@@ -17008,7 +17113,30 @@ def start_ctx_metadata_server(args):
             self._send_json({"error": {"message": "missing or invalid API key", "type": "authentication_error"}}, status=401)
             return False
 
+        def _maintenance_gate(self) -> bool:
+            try:
+                if not _maintenance_flag_active():
+                    return False
+                host = self.client_address[0] if getattr(self, "client_address", None) else ""
+                return not _is_loopback_client(host)
+            except Exception:
+                return False
+
+        def _reject_maintenance(self) -> None:
+            try:
+                body = json.dumps({"error": {"message": "maintenance mode: only local requests are accepted", "type": "service_unavailable", "code": "maintenance"}}).encode()
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", "60")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+
         def do_GET(self):
+            if self._maintenance_gate():
+                return self._reject_maintenance()
             parsed = urlparse(self.path)
             api_prefix = _resolve_api_prefix()
             if api_prefix:
@@ -17112,6 +17240,8 @@ def start_ctx_metadata_server(args):
             self._send_json({"error": "not found"}, status=404)
 
         def do_POST(self):
+            if self._maintenance_gate():
+                return self._reject_maintenance()
             parsed = urlparse(self.path)
             api_prefix = _resolve_api_prefix()
             if api_prefix:
@@ -17894,7 +18024,7 @@ def start_ctx_metadata_server(args):
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": "messages or prompt is required"}, status=400)
                 return
-            if _messages_include_images(messages) and (model_entry is None or not _has_configured_mmproj_runtime(model_entry)):
+            if _messages_include_images(messages) and (model_entry is None or not (_has_configured_mmproj_runtime(model_entry) or _model_is_vllm_multimodal(model_entry))):
                 self._send_json(
                     {
                         "error": (
@@ -18404,7 +18534,7 @@ def start_ctx_metadata_server(args):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 self._send_json({"error": {"message": "messages is required", "type": "invalid_request_error"}}, status=400)
                 return
-            if _messages_include_images(messages) and (model_entry is None or not _has_configured_mmproj_runtime(model_entry)):
+            if _messages_include_images(messages) and (model_entry is None or not (_has_configured_mmproj_runtime(model_entry) or _model_is_vllm_multimodal(model_entry))):
                 error_message = (
                     f"model '{model_name}' is installed without multimodal projector support (mmproj). "
                     "Use a vision model or re-add/update this model so the matching mmproj GGUF is downloaded and configured."
@@ -18415,7 +18545,7 @@ def start_ctx_metadata_server(args):
                         "model": model_name,
                         "request_id": request_id,
                         "has_model_entry": model_entry is not None,
-                        "vision": bool(model_entry and _has_configured_mmproj_runtime(model_entry)),
+                        "vision": bool(model_entry and (_has_configured_mmproj_runtime(model_entry) or _model_is_vllm_multimodal(model_entry))),
                         "payload": _summarize_api_payload_for_log(payload),
                     },
                 )
@@ -18856,6 +18986,12 @@ def start_ctx_metadata_server(args):
                 stream_tool_call_chunks = 0
                 stream_finish_reason = ""
                 stream_visible_content_parts: list[str] = []
+                stream_reasoning_parts: list[str] = []
+                stream_tool_arg_parts: list[str] = []
+                try:
+                    _dv_on = bool(_draft_vocab_cfg(args).get("enabled"))
+                except Exception:
+                    _dv_on = False
                 try:
                     for line in response.iter_lines():
                         if _openai_stream_tee is not None:
@@ -18892,8 +19028,15 @@ def start_ctx_metadata_server(args):
                                             stream_visible_content_parts.append(str(content))
                                         if reasoning:
                                             stream_reasoning_len += len(str(reasoning))
+                                            if _dv_on:
+                                                stream_reasoning_parts.append(str(reasoning))
                                         if tool_calls:
                                             stream_tool_call_chunks += len(tool_calls) if isinstance(tool_calls, list) else 1
+                                            if _dv_on and isinstance(tool_calls, list):
+                                                for _tc in tool_calls:
+                                                    _tc_arg = ((_tc or {}).get("function") or {}).get("arguments")
+                                                    if _tc_arg:
+                                                        stream_tool_arg_parts.append(str(_tc_arg))
                                         if content or reasoning or tool_calls or finish_reason:
                                             log_api_event("openai_chat_stream_chunk_received", {
                                                 "request_id": request_id,
@@ -18934,6 +19077,10 @@ def start_ctx_metadata_server(args):
                     _finish_openai_chat_request()
                     reasoning_only_final = stream_reasoning_len > 0 and stream_visible_content_len == 0 and stream_tool_call_chunks == 0
                     log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": stream_visible_content_len, "reasoning_len": stream_reasoning_len, "tool_call_chunks": stream_tool_call_chunks, "finish_reason": stream_finish_reason, "reasoning_only_final": reasoning_only_final, "router_state": replica_trace_state_for_base(model_name)})
+                    try:
+                        _capture_draft_vocab(args, catalog, model_name, [*stream_visible_content_parts, *stream_reasoning_parts, *stream_tool_arg_parts])
+                    except Exception:
+                        pass
                     _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, content="".join(stream_visible_content_parts), reasoning_len=stream_reasoning_len, tool_calls=[{}] * stream_tool_call_chunks if stream_tool_call_chunks > 0 else [], tool_call_chunks=stream_tool_call_chunks, finish_reason=stream_finish_reason, repair_rounds=stream_repair_round_used)
                     if stream_tool_call_chunks == 0:
                         _capture_tool_intent_failure(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, payload=upstream_payload, response={"content": "".join(stream_visible_content_parts), "reasoning_len": stream_reasoning_len, "tool_call_chunks": stream_tool_call_chunks, "finish_reason": stream_finish_reason, "repair_rounds": stream_repair_round_used})
@@ -19042,6 +19189,15 @@ def start_ctx_metadata_server(args):
                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
             _finish_openai_chat_request()
             log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": False, "visible_content_len": len(nonstream_content), "reasoning_len": len(nonstream_reasoning), "tool_calls_count": len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), "finish_reason": choice.get("finish_reason") or "", "reasoning_only_final": nonstream_reasoning_only, "router_state": replica_trace_state_for_base(model_name)})
+            try:
+                _nonstream_dv_args: list[str] = []
+                for _tc in (nonstream_tool_calls if isinstance(nonstream_tool_calls, list) else []):
+                    _tc_fn = (_tc or {}).get("function") or {}
+                    if _tc_fn.get("arguments"):
+                        _nonstream_dv_args.append(str(_tc_fn["arguments"]))
+                _capture_draft_vocab(args, catalog, model_name, [nonstream_content or "", nonstream_reasoning or "", "".join(_nonstream_dv_args)])
+            except Exception:
+                pass
             _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=False, content=nonstream_content, reasoning=nonstream_reasoning, tool_calls=nonstream_tool_calls, tool_call_chunks=len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), finish_reason=choice.get("finish_reason") or "", repair_rounds=repair_rounds_used)
             if not nonstream_tool_calls:
                 _capture_tool_intent_failure(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=False, payload=upstream_payload, response={"content": nonstream_content, "reasoning": nonstream_reasoning, "finish_reason": choice.get("finish_reason") or "", "repair_rounds": repair_rounds_used})
@@ -19316,7 +19472,7 @@ def start_ctx_metadata_server(args):
                 else None
             )
             namespace_tool_map = _responses_namespace_tool_map(payload.get("tools")) if flatten_namespace_tools else {}
-            allow_tool_output_images = bool(model_entry and _has_configured_mmproj_runtime(model_entry))
+            allow_tool_output_images = bool(model_entry and (_has_configured_mmproj_runtime(model_entry) or _model_is_vllm_multimodal(model_entry)))
             upstream_payload = _responses_payload_to_chat_payload(
                 payload,
                 upstream_route_id,
@@ -19372,7 +19528,7 @@ def start_ctx_metadata_server(args):
                         "model": model_name,
                         "request_id": request_id,
                         "has_model_entry": model_entry is not None,
-                        "vision": bool(model_entry and _has_configured_mmproj_runtime(model_entry)),
+                        "vision": bool(model_entry and (_has_configured_mmproj_runtime(model_entry) or _model_is_vllm_multimodal(model_entry))),
                         "payload": _summarize_api_payload_for_log(upstream_payload),
                     },
                 )

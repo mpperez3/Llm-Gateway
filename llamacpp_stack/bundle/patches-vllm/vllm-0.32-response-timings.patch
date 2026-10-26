@@ -1,0 +1,87 @@
+vLLM 0.32.0: return llama.cpp-compatible `timings` in chat responses
+
+llama-swap derives the model dashboard's Prefill/Decode from the response body's
+`timings` object (prompt_per_second / predicted_per_second), the same block
+llama-server emits. vLLM's response has only `usage`, so the panel stayed empty.
+
+Adds an optional `timings` field to ChatCompletionResponse and
+ChatCompletionStreamResponse (final chunk) and fills it from RequestStateStats.
+
+Apply from site-packages: patch -p1 < this-file
+Revert:                  patch -R -p1 < this-file
+
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -140,6 +140,8 @@
+     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
+     system_fingerprint: str | None = None
+     usage: UsageInfo
++    # llama.cpp-compatible timings so llama-swap can show Prefill/Decode.
++    timings: dict[str, float] | None = None
+ 
+     # vLLM-specific fields that are not in OpenAI spec
+     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
+@@ -177,6 +179,8 @@
+     model: str
+     choices: list[ChatCompletionResponseStreamChoice]
+     usage: UsageInfo | None = Field(default=None)
++    # llama.cpp-compatible timings (final chunk only), for llama-swap metrics.
++    timings: dict[str, float] | None = None
+     # Set only on the final chunk of a stream to mirror non-streaming responses
+     # without the per-chunk serialization overhead.
+     system_fingerprint: str | None = None
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -115,6 +115,36 @@
+     return CompletionTokenUsageInfo(reasoning_tokens=reasoning_tokens)
+ 
+ 
++def _tq_llamacpp_timings(final_res) -> dict[str, float] | None:
++    """llama.cpp-compatible timings block (llama-swap reads prompt/predicted_per_second)."""
++    try:
++        st = getattr(final_res, "metrics", None)
++        if st is None:
++            return None
++        gen_n = int(getattr(st, "num_generation_tokens", 0) or 0)
++        pids = getattr(final_res, "prompt_token_ids", None)
++        prompt_n = len(pids) if pids else 0
++        ft = float(getattr(st, "first_token_ts", 0.0) or 0.0)
++        sched = float(getattr(st, "scheduled_ts", 0.0) or 0.0)
++        lt = float(getattr(st, "last_token_ts", 0.0) or 0.0)
++        if gen_n <= 0 or prompt_n <= 0 or ft <= 0.0 or lt <= 0.0:
++            return None
++        p_ms = max(0.0, (ft - sched) * 1000.0)
++        d_ms = max(0.0, (lt - ft) * 1000.0)
++        return {
++            "prompt_n": float(prompt_n),
++            "prompt_ms": p_ms,
++            "prompt_per_token_ms": (p_ms / prompt_n) if prompt_n else 0.0,
++            "prompt_per_second": (prompt_n / (p_ms / 1000.0)) if p_ms > 0 else 0.0,
++            "predicted_n": float(gen_n),
++            "predicted_ms": d_ms,
++            "predicted_per_token_ms": (d_ms / gen_n) if gen_n else 0.0,
++            "predicted_per_second": (gen_n / (d_ms / 1000.0)) if d_ms > 0 else 0.0,
++        }
++    except Exception:
++        return None
++
++
+ class OpenAIServingChat(GenerateBaseServing):
+     def __init__(
+         self,
+@@ -884,6 +914,7 @@
+                     choices=[],
+                     model=model_name,
+                     usage=final_usage,
++                    timings=_tq_llamacpp_timings(last_res),
+                     system_fingerprint=self.system_fingerprint,
+                     metrics=stream_per_request_metrics,
+                 )
+@@ -1194,6 +1225,7 @@
+             model=model_name,
+             choices=choices,
+             usage=usage,
++            timings=_tq_llamacpp_timings(final_res),
+             system_fingerprint=self.system_fingerprint,
+             prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),
+             prompt_token_ids=(

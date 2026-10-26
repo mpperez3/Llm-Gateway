@@ -1,0 +1,55 @@
+vLLM 0.32.0: stop Qwen3.5 MTP from allocating duplicate F16 embed/lm_head
+
+Qwen3.5 MTP has no embedding and no output head of its own: `load_eagle_model`
+-> `maybe_share_target_embed` / the lm_head block in
+vllm/v1/worker/gpu/spec_decode/eagle/utils.py point the drafter at the target's
+modules *after* construction. The constructors in qwen3_5_mtp.py nevertheless
+allocate a 248320x5120 F16 embedding and a second F16 lm_head (2.37 GiB each),
+which is a 4.74 GiB transient peak at load time. On a single 24 GB RTX 4090 that
+is what makes 262144 context impossible with MTP enabled.
+
+Measured (SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16, 262144 ctx, TP=2):
+boot 176 s -> 68 s, no OOM while the draft model is built.
+
+Apply from the vLLM site-packages root:  patch -p1 < this-file
+Revert:                                  patch -R -p1 < this-file
+
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -81,10 +81,12 @@
+         self.mtp_start_layer_idx = config.num_hidden_layers
+         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
+ 
+-        self.embed_tokens = VocabParallelEmbedding(
+-            self.vocab_size,
+-            config.hidden_size,
+-        )
++        # Qwen3.5 MTP has no embedding of its own: `load_eagle_model` ->
++        # `maybe_share_target_embed` points this at the target's module right
++        # after construction. Allocating a second F16 copy (2.37 GiB) here just
++        # to delete it afterwards is what kept 262144 context off a single
++        # 24 GB GPU.
++        self.embed_tokens = PPMissingLayer()
+ 
+         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
+         # missing from hf_quant_config.json exclude_modules. Force unquantized.
+@@ -235,14 +237,11 @@
+         )
+ 
+         if get_pp_group().is_last_rank:
+-            self.lm_head = ParallelLMHead(
+-                config.vocab_size,
+-                config.hidden_size,
+-                quant_config=self.quant_config,
+-                prefix=maybe_prefix(prefix, "lm_head"),
+-            )
+-            if config.tie_word_embeddings:
+-                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
++            # Same story as embed_tokens: the MTP head IS the target's output
++            # head (the checkpoint ships no `mtp.lm_head`), and `load_eagle_model`
++            # assigns it here after loading. A second F16 copy is 2.37 GiB of
++            # pure waste; keep a placeholder and let the sharing code wire it.
++            self.lm_head = PPMissingLayer()
+         else:
+             self.lm_head = PPMissingLayer()
+ 

@@ -826,10 +826,20 @@ def _normalize_server_config_payload(payload: dict[str, object]) -> dict[str, ob
     norm_req = _normalize_requests_log_config(raw_req)
     raw_ls = raw_logging.get("llama_swap") if isinstance(raw_logging, dict) else None
     norm_ls = _normalize_llama_swap_config(raw_ls)
-    result["logging"] = {"requests_log": norm_req, "llama_swap": norm_ls}
+    try:
+        from llamacpp_stack.cli.draft_vocab import normalize_config as _live_dv_norm  # type: ignore
+    except Exception:
+        _live_dv_norm = None
+    raw_dv = raw_logging.get("draft_vocab") if isinstance(raw_logging, dict) else None
+    if _live_dv_norm is not None:
+        norm_dv = _live_dv_norm(raw_dv)
+    else:
+        norm_dv = {"enabled": False, "sample_every": 10, "max_tokens_per_response": 4096,
+                   "max_keys": 200000, "flush_interval_s": 120, "dir": ""}
+    result["logging"] = {"requests_log": norm_req, "llama_swap": norm_ls, "draft_vocab": norm_dv}
     if isinstance(raw_logging, dict):
         for k, v in raw_logging.items():
-            if k not in ("requests_log", "llama_swap") and k not in result["logging"]:
+            if k not in ("requests_log", "llama_swap", "draft_vocab") and k not in result["logging"]:
                 result["logging"][k] = v
     result.setdefault("api_ctx_factor", 0.5)
     result.setdefault("idle_ttl", DEFAULT_IDLE_TTL)
