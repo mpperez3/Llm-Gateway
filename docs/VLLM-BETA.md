@@ -295,11 +295,13 @@ Resumen:
   (`LLM_SERVER_DRAFT_VOCAB=0` lo desactiva).
 
 Medición 2026-10-26 (2×4090 TP=2, 1,1k prompt, 256 gen, `temperature 0`, 5 reps):
-decode mediana **120,4 tok/s** (rango 115-127) con el draft vocab, frente a 107,1
-sin él (+12 %); prefill ~1960 tok/s. A temp 0 `probabilistic` y `greedy` empatan y
-`align` no cambia decode. Ya estamos en el C1 de la receta en una 3090 (121 tok/s);
-el resto de su ventaja es el drafter DFlash2 (no portado a 0.32) y el lm_head/MTP
-int4.
+**DFlash2 d7: 127,1 tok/s** de mediana (117,7-154,8) frente a 116,5 con MTP d3 + draft
+vocab y 107,1 sin vocab; prefill ~1900-1975. A temp 0 `probabilistic` y `greedy`
+empatan y `align` no cambia decode. DFlash2 **sí existe en vLLM 0.32**
+(`qwen3_dflash2` + `DFlashProposer`): se baja el drafter W4A16 de 1,2 GB y se
+configura con `method: dflash`. Cuesta ~30 % del pool de KV (1,71× en vez de 2,46×
+a 262k) y da +9 % en C1. Sin los parches de lookup de la receta no llegamos a sus
+381 tok/s citando contexto (aquí 132,6 a 27k).
 
 ## References
 

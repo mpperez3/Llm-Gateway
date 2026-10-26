@@ -47,7 +47,7 @@ y `docs/optimizations.md`.
 | 8 | `int4-kv-per-token-head.patch` | KV int4/int8 per-token-head (perfil CTX=long/huge de la receta). | Alternativa a `fp8` cuando se quiere más contexto. |
 | 9 | `xgrammar-spec-terminated.patch` | Cerrado de gramáticas con spec-decode (tool calls). | Toca xgrammar; revisar versión. |
 | 10 | `vision-tower-cpu-offload.patch` | Descarga el vision tower a CPU cuando no se usa (ahorra ~0,9 GiB de VRAM). | Solo si volvemos a `--language-model-only`. |
-| — | `dflash2-*.patch` (7) + `prepare/fetch_dflash2.py` | Drafter DFlash2: 7 drafts en un pase, 127-131 tok/s C1, 381 citando contexto. | **No en 0.32**: la receta lo corre nativo en 0.28.0. Requiere port a V2 runner de 0.32. |
+| ~~—~~ | ~~`dflash2-*.patch`~~ ✅ **nativo en 0.32** | Drafter DFlash2: 7 drafts en un pase. Medido aquí: **127,1 tok/s C1** (vs 116,5 con MTP) y 132,6 en tarea de citar a 27k. | vLLM 0.32 trae `qwen3_dflash2.py` + `DFlashProposer`; solo hay que bajar el drafter. Los parches `dflash2-*.patch` de la receta (lookup, ngram chains) siguen sin portar: sin ellos no se llega a sus 381 en citas largas. |
 
 ## Pipeline de prepare de la receta (pendiente)
 
@@ -107,6 +107,57 @@ python tools/build_draft_vocab.py "$MODEL" --ids tools/draft_vocab_ids.json
   bf16 (`Attempted to load weight draft_lm_head.weight_scale with dtype torch.float16
   into parameter with dtype torch.bfloat16`); los valores son correctos.
 - Desactivar: `MTP_DRAFT_VOCAB=0` en el entorno del motor.
+
+## DFlash2 en vLLM 0.32 (aplicado 2026-10-26)
+
+**Sí hay DFlash2 en 0.32**: el wheel trae `vllm/v1/spec_decode/dflash.py`
+(`DFlashProposer`), `vllm/model_executor/models/qwen3_dflash2.py`
+(`DFlash2Qwen3ForCausalLM`, registrado como `DFlash2DraftModel`) y el speculator
+`dflash2` en `transformers_utils/configs/speculators/algos.py`. No hace falta
+portar el runner: el drafter pre-cuantizado de la receta carga tal cual.
+
+```bash
+# drafter W4A16-GPTQ (1.2 GB; el bf16 original son 3.85 GB)
+python - <<'EOF'
+from huggingface_hub import snapshot_download
+snapshot_download("syvai/Qwen3.8-27B-DFlash2-W4A16",
+                  local_dir="/var/llamacpp_models/syvai/Qwen3.8-27B-DFlash2-W4A16",
+                  allow_patterns=["*.json", "*.safetensors", "README.md"])
+EOF
+```
+
+`catalog.json` → `server_overrides.vllm.speculative_config`:
+
+```json
+{
+  "method": "dflash",
+  "model": "/var/llamacpp_models/syvai/Qwen3.8-27B-DFlash2-W4A16",
+  "num_speculative_tokens": 7,
+  "draft_sample_method": "probabilistic"
+}
+```
+
+- `draft_sample_method: probabilistic` es obligatorio aquí: con el default
+  (`greedy`) la aceptación se hunde (la receta mide 2,66 vs 3,23 tok/paso).
+- Aviso benigno: `no KV cache group could be identified as the draft model's`
+  (DFlash2 consume los hidden states del target, no tiene KV propio).
+- Revertir a MTP: `{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}`
+  (el draft vocab 40 960 sigue en el modelo y se reutiliza).
+
+### Medición
+
+| | MTP d3 + vocab | DFlash2 d7 |
+|---|---|---|
+| C1 (5 reps, 1,1k/256) | 116,5 | **127,1** (117,7-154,8) |
+| prefill | ~1975 | ~1900 |
+| C4 agregado | 185,9 | 184,8 |
+| C8 agregado | 246,6 | 244,9 |
+| citar 27k | — | **132,6** decode, 2033 prefill |
+| KV pool | 644 376 tok (2,46× a 262k) | 448 447 tok (1,71×) |
+| VRAM | 22,1 GiB/GPU | 21,9 GiB/GPU |
+
+Coste: el pool de KV baja ~30 % (1,71× en vez de 2,46× a 262 144), así que con 8
+slots caben menos peticiones *largas* a la vez. A cambio, +9 % en C1.
 
 ## Concurrencia (2026-10-26)
 
