@@ -27,7 +27,7 @@ build-backend = "setuptools.build_meta"
 packages = ["llamacpp_stack", "llamacpp_stack.bundle", "llamacpp_stack.cli"]
 
 [tool.setuptools.package-data]
-"llamacpp_stack.bundle" = ["*.sh", "*.yaml", "*.yml", "patches/*.patch"]
+"llamacpp_stack.bundle" = ["*.sh", "*.yaml", "*.yml", "patches/*.patch", "patches-vllm/*.patch", "vllm_build_draft_vocab.py", "vllm_draft_vocab_ids.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

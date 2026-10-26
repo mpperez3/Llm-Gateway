@@ -288,7 +288,11 @@ Resumen:
   Fuente: <https://github.com/xvus/syv-ai-qwen38-27b-rtx3090>.
 - **Knobs ya en catálogo**: `draft_sample_method: probabilistic` (importa con
   `temperature > 0`), `mamba_cache_mode: align` (híbrido + prefix caching),
-  `enable_per_request_metrics` + `enable_force_include_usage` (timings por petición).
+  `enable_per_request_metrics` + `enable_force_include_usage` (timings por petición),
+  `max_num_seqs: 8` (C8 agregado 247 tok/s; C1 116,5).
+- **Draft vocab en el gateway**: `llm-server vllm-draft-vocab [--model ID] [--force]`
+  lo construye; también se ejecuta solo al añadir un modelo vLLM con pesos `mtp.*`
+  (`LLM_SERVER_DRAFT_VOCAB=0` lo desactiva).
 
 Medición 2026-10-26 (2×4090 TP=2, 1,1k prompt, 256 gen, `temperature 0`, 5 reps):
 decode mediana **120,4 tok/s** (rango 115-127) con el draft vocab, frente a 107,1

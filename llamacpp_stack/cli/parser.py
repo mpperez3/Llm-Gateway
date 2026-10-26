@@ -120,6 +120,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     list_models = getattr(_cli_mod, "list_models")
     migrate_server_config = getattr(_cli_mod, "migrate_server_config")
     print_config_keys = getattr(_cli_mod, "print_config_keys")
+    vllm_draft_vocab = getattr(_cli_mod, "vllm_draft_vocab")
     refresh_templates = getattr(_cli_mod, "refresh_templates")
     remove_models = getattr(_cli_mod, "remove_models")
     remove_orphan_models = getattr(_cli_mod, "remove_orphan_models")
@@ -318,6 +319,29 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     subparsers["config-keys"] = p_config_keys
     p_config_keys.set_defaults(func=print_config_keys)
     p_config_keys.add_argument("--format", choices=("text", "json"), default="text")
+
+    p_draft_vocab = sub.add_parser(
+        "vllm-draft-vocab",
+        help="Build the vocab-truncated MTP draft head for vLLM models",
+        description=(
+            "Slices the MTP drafter head down to the 40960 most frequent token ids "
+            "(mtp_draft_vocab_ids.pt + mtp.draft_lm_head.*) so each draft pass reads "
+            "213 MB instead of the full ~1.3 GB head. Requires the vLLM patch "
+            "vllm-0.32-qwen35-mtp-draft-vocab.patch. Rebuild optional: --force."
+        ),
+    )
+    subparsers["vllm-draft-vocab"] = p_draft_vocab
+    p_draft_vocab.set_defaults(func=vllm_draft_vocab)
+    p_draft_vocab.add_argument("--model", default=None,
+                               help="catalog model id or alias (default: every vLLM model with MTP weights)")
+    p_draft_vocab.add_argument("--force", action="store_true",
+                               help="rebuild even when mtp_draft_vocab_ids.pt already exists")
+    p_draft_vocab.add_argument("--ids", default=None,
+                               help="JSON id list (default: bundled vllm_draft_vocab_ids.json)")
+    p_draft_vocab.add_argument("--n", type=int, default=None,
+                               help="build N ids from --corpus instead of the bundled list")
+    p_draft_vocab.add_argument("--corpus", nargs="*", default=None,
+                               help="corpus files (.txt/.jsonl/.parquet) for --n")
 
     p_refresh = sub.add_parser(
         "refresh-templates",

@@ -6648,6 +6648,124 @@ def _capture_draft_vocab(args, catalog, model_name: str, texts) -> None:
         pass
 
 
+def _draft_vocab_assets() -> tuple[Path | None, Path | None]:
+    """Locate the vendored builder and id list (package bundle first, then tools/)."""
+    here = Path(__file__).resolve().parent
+    ids_candidates = [
+        here / "bundle" / "vllm_draft_vocab_ids.json",
+        here.parent / "tools" / "draft_vocab_ids.json",
+    ]
+    script_candidates = [
+        here / "bundle" / "vllm_build_draft_vocab.py",
+        here.parent / "tools" / "build_draft_vocab.py",
+    ]
+    return (
+        next((p for p in script_candidates if p.exists()), None),
+        next((p for p in ids_candidates if p.exists()), None),
+    )
+
+
+def _model_has_mtp_weights(model) -> bool:
+    try:
+        index_path = Path(str(model.local_path)) / "model.safetensors.index.json"
+        if not index_path.exists():
+            return False
+        weight_map = json.loads(index_path.read_text(encoding="utf-8")).get("weight_map") or {}
+        return any(str(k).startswith("mtp.") for k in weight_map)
+    except Exception:
+        return False
+
+
+def _build_draft_vocab_for_model(
+    model,
+    *,
+    force: bool = False,
+    ids_path: str | None = None,
+    n: int | None = None,
+    corpus: list[str] | None = None,
+) -> int:
+    model_dir = Path(str(model.local_path))
+    marker = model_dir / "mtp_draft_vocab_ids.pt"
+    if marker.exists() and not force:
+        print(f"[draft-vocab] {model.model_id}: ya existe {marker.name}; usa --force para regenerarlo")
+        return 0
+    if not _model_has_mtp_weights(model):
+        print(f"[draft-vocab] {model.model_id}: sin tensores mtp.* en el indice, se omite")
+        return 0
+    script, bundled_ids = _draft_vocab_assets()
+    if script is None:
+        print("[draft-vocab] no encuentro vllm_build_draft_vocab.py ni tools/build_draft_vocab.py", file=sys.stderr)
+        return 1
+    cmd = [sys.executable, str(script), str(model_dir)]
+    if n:
+        cmd += ["--n", str(int(n))]
+        if corpus:
+            cmd += ["--corpus", *map(str, corpus)]
+    else:
+        ids = ids_path or (str(bundled_ids) if bundled_ids else None)
+        if not ids:
+            print("[draft-vocab] no hay lista de ids; pasa --ids o --n --corpus", file=sys.stderr)
+            return 1
+        cmd += ["--ids", str(ids)]
+    print(f"[draft-vocab] {model.model_id}: construyendo head truncado")
+    return subprocess.run(cmd, check=False).returncode
+
+
+def vllm_draft_vocab(args) -> int:
+    """CLI: build the vocab-truncated MTP draft head for vLLM models."""
+    catalog_path = Path(getattr(args, "catalog", None) or DEFAULT_CATALOG_PATH)
+    models = load_catalog(catalog_path)
+    wanted = getattr(args, "model", None)
+    if wanted:
+        targets = [
+            m for m in models
+            if m.model_id == wanted or wanted in (getattr(m, "aliases", None) or [])
+        ]
+        if not targets:
+            print(f"[draft-vocab] modelo no encontrado: {wanted}", file=sys.stderr)
+            return 2
+    else:
+        targets = [
+            m for m in models
+            if str(getattr(m, "backend", "")).lower() == "vllm" and _model_has_mtp_weights(m)
+        ]
+    if not targets:
+        print("[draft-vocab] no hay modelos vLLM con MTP que procesar")
+        return 0
+    rc = 0
+    for model in targets:
+        rc |= _build_draft_vocab_for_model(
+            model,
+            force=bool(getattr(args, "force", False)),
+            ids_path=getattr(args, "ids", None),
+            n=getattr(args, "n", None),
+            corpus=getattr(args, "corpus", None),
+        )
+    return rc
+
+
+def maybe_build_draft_vocab_after_add(args) -> None:
+    """Best-effort: after adding a vLLM model, build its MTP draft vocab."""
+    try:
+        if os.environ.get("LLM_SERVER_DRAFT_VOCAB", "1") == "0":
+            return
+        models = load_catalog(Path(DEFAULT_CATALOG_PATH))
+        mid = getattr(args, "model_id", None)
+        repo_id = getattr(args, "repo", None) or getattr(args, "hf", None)
+        target = None
+        for model in models:
+            if mid and model.model_id == mid:
+                target = model
+                break
+            if repo_id and getattr(model, "repo_id", None) == repo_id:
+                target = model
+        if target is None or str(getattr(target, "backend", "")).lower() != "vllm":
+            return
+        _build_draft_vocab_for_model(target)
+    except Exception as exc:  # optional drafter head must never fail an add
+        print(f"[draft-vocab] aviso: no se pudo generar el vocabulario de draft: {exc}", file=sys.stderr)
+
+
 def print_config_keys(args) -> int:
     catalog_keys = _catalog_model_key_names()
     server_default_keys = sorted(set(_load_bundled_llama_server_default_values().keys()) | set(resolve_llama_server_defaults(args).keys()))
@@ -24559,9 +24677,9 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     parser.add_argument("--api-ctx-factor", type=float, default=None)
     parser.add_argument("--flatten", action=argparse.BooleanOptionalAction, default=None, help="Flatten Responses-native tools (namespaces) to standard function tools.")
     public_command_metavar = (
-        "{add,run,remove,rm,unload,update,config-migrate,refresh-templates,"
-        "remove-templates,validate,daemon,debug,auto-performance,list,ps,"
-        "requests,logs,hacks,info}"
+        "{add,run,remove,rm,unload,update,config-migrate,config-keys,"
+        "vllm-draft-vocab,refresh-templates,remove-templates,validate,daemon,"
+        "debug,auto-performance,list,ps,requests,logs,hacks,info}"
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar=public_command_metavar)
     subparsers: dict[str, argparse.ArgumentParser] = {}
@@ -24723,6 +24841,29 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     subparsers["config-keys"] = p_config_keys
     p_config_keys.set_defaults(func=print_config_keys)
     p_config_keys.add_argument("--format", choices=("text", "json"), default="text")
+
+    p_draft_vocab = sub.add_parser(
+        "vllm-draft-vocab",
+        help="Build the vocab-truncated MTP draft head for vLLM models",
+        description=(
+            "Slices the MTP drafter head down to the 40960 most frequent token ids "
+            "(mtp_draft_vocab_ids.pt + mtp.draft_lm_head.*) so each draft pass reads "
+            "213 MB instead of the full head. Requires the vLLM patch "
+            "vllm-0.32-qwen35-mtp-draft-vocab.patch."
+        ),
+    )
+    subparsers["vllm-draft-vocab"] = p_draft_vocab
+    p_draft_vocab.set_defaults(func=vllm_draft_vocab)
+    p_draft_vocab.add_argument("--model", default=None,
+                               help="catalog model id or alias (default: every vLLM model with MTP weights)")
+    p_draft_vocab.add_argument("--force", action="store_true",
+                               help="rebuild even when mtp_draft_vocab_ids.pt already exists")
+    p_draft_vocab.add_argument("--ids", default=None,
+                               help="JSON id list (default: bundled vllm_draft_vocab_ids.json)")
+    p_draft_vocab.add_argument("--n", type=int, default=None,
+                               help="build N ids from --corpus instead of the bundled list")
+    p_draft_vocab.add_argument("--corpus", nargs="*", default=None,
+                               help="corpus files (.txt/.jsonl/.parquet) for --n")
 
     p_refresh = sub.add_parser(
         "refresh-templates",

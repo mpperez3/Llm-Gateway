@@ -65,12 +65,25 @@ def _add_models_locally(args: argparse.Namespace) -> int:
             cloned.hf = None
             cloned.model_id = None
             ensure_model_available(cloned)
+            _maybe_build_draft_vocab(cloned)
         restart_service_to_free_vram(args.service)
         return 0
-    
-    res = ensure_model_available(_normalize_single_ref_args(args))
+
+    single = _normalize_single_ref_args(args)
+    res = ensure_model_available(single)
+    _maybe_build_draft_vocab(single)
     restart_service_to_free_vram(args.service)
     return res and 0
+
+
+def _maybe_build_draft_vocab(args: argparse.Namespace) -> None:
+    """Best-effort MTP draft vocab build after adding a vLLM model."""
+    try:
+        from llamacpp_stack._cli_impl import maybe_build_draft_vocab_after_add
+
+        maybe_build_draft_vocab_after_add(args)
+    except Exception:
+        pass
 
 
 # ============================================================================

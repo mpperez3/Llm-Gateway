@@ -21,6 +21,8 @@ positional arguments:
     update              Refresh model configuration or update dependencies
     config-migrate      Migrate/canonicalize the global conf.json
     config-keys         List valid configuration/catalog keys
+    vllm-draft-vocab    Build the vocab-truncated MTP draft head for vLLM
+                        models
     refresh-templates   Scan templates folder and add template-backed model
                         entries to catalog
     remove-templates    Remove all template-backed model entries from catalog

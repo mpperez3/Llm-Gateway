@@ -78,6 +78,18 @@ Ya estaban: `kv_cache_dtype fp8`, MTP `num_speculative_tokens 3`, `enable_prefix
 
 ## Draft vocab aplicado (2026-10-26)
 
+La vía normal es el propio gateway:
+
+```bash
+llm-server vllm-draft-vocab --model 'Qwen3.8-27B-AutoRound-INT4-[vLLM]'   # uno
+llm-server vllm-draft-vocab                                              # todos los vLLM con MTP
+llm-server vllm-draft-vocab --force                                      # regenerar
+```
+
+Se ejecuta **automáticamente al hacer `llm-server add` de un modelo vLLM con pesos
+`mtp.*`** (best-effort; `LLM_SERVER_DRAFT_VOCAB=0` lo desactiva). También se puede
+hacer a mano:
+
 ```bash
 # 1. backup del índice y de los extras del modelo (el script también hace su .bak-draft)
 cp -a "$MODEL/model.safetensors.index.json" "$MODEL/model.safetensors.index.json.bak-draftvocab"
@@ -95,6 +107,23 @@ python tools/build_draft_vocab.py "$MODEL" --ids tools/draft_vocab_ids.json
   bf16 (`Attempted to load weight draft_lm_head.weight_scale with dtype torch.float16
   into parameter with dtype torch.bfloat16`); los valores son correctos.
 - Desactivar: `MTP_DRAFT_VOCAB=0` en el entorno del motor.
+
+## Concurrencia (2026-10-26)
+
+`max_num_seqs` probado a 2 / 4 / 8 con 1,1k de prompt y 256 generados (agregado =
+tokens / pared, incluye prefill; per-request desde `timings`):
+
+| max_num_seqs | C1 | C2 | C4 | C8 |
+|---|---|---|---|---|
+| 2 | 120,4 | — (cola) | — | — |
+| 4 | 111-115 | 121-130 | **181,8** | 192,9 (cola) |
+| **8** | **116,5** | **124,9** | **185,9** | **246,6** |
+
+- C1 baja ~3 % al pasar de 2 a 8 (dentro del ruido de la receta, 122±5), pero el
+  agregado a C8 sube de ~193 a **247 tok/s**. Se queda en **8**.
+- El pool queda en **644 376 tokens** de KV (2,46× a 262 144 por petición):
+  caben 8 peticiones cortas, no 8 de 262k (esas hacen cola/preempt).
+- VRAM: 22,1 GiB de 24,5 por GPU con el modelo cargado.
 
 ## Medición (2026-10-26, 2×4090, TP=2, 1,1k prompt, 256 gen, `temperature 0`)
 
