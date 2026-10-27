@@ -417,6 +417,12 @@ Clients see a single reasoning spelling. vLLM emits `delta.reasoning`; the
 gateway renames it to `reasoning_content` (streaming and non-streaming) so the
 same client code works against llama.cpp, buun and vLLM.
 
+vLLM also packs the last reasoning token and the first answer token into the
+same delta (`{"content": "You", "reasoning_content": " read it."}`). The relay
+splits that frame into two standard deltas (usage kept on the last one) because
+clients that expect one part type per frame drop the connection right after the
+first visible token — the "answer cut after the first words" symptom.
+
 ### Conversation replicas
 
 Replicas are disabled by default and are controlled globally. They are

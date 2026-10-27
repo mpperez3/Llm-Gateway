@@ -12873,11 +12873,58 @@ def _normalize_reasoning_field(
     return changed
 
 
+def _split_mixed_stream_delta(chunk: dict) -> list[dict]:
+    """Split one upstream delta that mixes parts into one frame per part.
+
+    vLLM emits the last reasoning token and the first answer token in the same
+    delta (``{"content": "You", "reasoning_content": " read it."}``). Clients
+    that rebuild the assistant message from deltas expect one part type per
+    frame; a mixed frame makes them drop the connection right after the first
+    visible token (seen as a broken-pipe abort on every vLLM chat).
+    """
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        return [chunk]
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return [chunk]
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        return [chunk]
+    parts: list[dict] = []
+    if delta.get("reasoning_content"):
+        parts.append({"reasoning_content": delta["reasoning_content"]})
+    if delta.get("content"):
+        parts.append({"content": delta["content"]})
+    if delta.get("tool_calls"):
+        parts.append({"tool_calls": delta["tool_calls"]})
+    if len(parts) < 2:
+        return [chunk]
+    frames: list[dict] = []
+    for index, part in enumerate(parts):
+        new_delta = dict(part)
+        if index == 0 and delta.get("role"):
+            new_delta["role"] = delta["role"]
+        new_choice = dict(choice)
+        new_choice["delta"] = new_delta
+        frame = dict(chunk)
+        frame["choices"] = [new_choice]
+        if index != len(parts) - 1:
+            # Keep the usage block only on the trailing frame.
+            frame.pop("usage", None)
+        frames.append(frame)
+    return frames
+
+
 def _normalize_openai_stream_reasoning_line(line: object) -> object:
-    """Rename ``reasoning`` deltas to ``reasoning_content`` in one SSE line."""
+    """Rename ``reasoning`` deltas to ``reasoning_content`` and split mixed frames.
+
+    A chunk may expand into several ``data:`` frames separated by a blank line;
+    the relay writes the terminating blank line from the source's empty line.
+    """
     is_bytes = isinstance(line, (bytes, bytearray))
     text = bytes(line).decode("utf-8", errors="ignore") if is_bytes else str(line or "")
-    if not text.startswith("data: ") or '"reasoning"' not in text:
+    if not text.startswith("data: ") or ('"reasoning"' not in text and '"reasoning_content"' not in text):
         return line
     raw = text[6:].strip()
     if raw in ("", "[DONE]"):
@@ -12886,16 +12933,22 @@ def _normalize_openai_stream_reasoning_line(line: object) -> object:
         chunk = json.loads(raw)
     except Exception:
         return line
+    if not isinstance(chunk, dict):
+        return line
     changed = False
     for choice in chunk.get("choices") or []:
         if not isinstance(choice, dict):
             continue
         changed |= _normalize_reasoning_field(choice.get("delta") or {})
         changed |= _normalize_reasoning_field(choice.get("message") or {})
-    if not changed:
+    frames = _split_mixed_stream_delta(chunk)
+    if not changed and len(frames) == 1:
         return line
-    normalized = "data: " + json.dumps(chunk, ensure_ascii=False, separators=(",", ":"))
-    return normalized.encode("utf-8") if is_bytes else normalized
+    payload = b"\n\n".join(
+        b"data: " + json.dumps(frame, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        for frame in frames
+    )
+    return payload if is_bytes else payload.decode("utf-8")
 
 
 def _parse_chat_template_kwargs(value: object) -> dict[str, object]:
