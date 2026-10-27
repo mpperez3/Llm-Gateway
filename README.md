@@ -423,6 +423,11 @@ splits that frame into two standard deltas (usage kept on the last one) because
 clients that expect one part type per frame drop the connection right after the
 first visible token — the "answer cut after the first words" symptom.
 
+Both entry points do it: the API gateway (`:11435`) and the llama-swap guard
+(`:11436`), which is what the web UI and direct clients such as Hermes use.
+Clients wired to `:11436` never touch the gateway, so a fix there alone does not
+reach them.
+
 ### Conversation replicas
 
 Replicas are disabled by default and are controlled globally. They are

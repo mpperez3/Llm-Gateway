@@ -12916,6 +12916,46 @@ def _split_mixed_stream_delta(chunk: dict) -> list[dict]:
     return frames
 
 
+def _normalize_openai_json_reasoning_body(content: bytes) -> bytes:
+    """Rename ``message.reasoning`` to ``reasoning_content`` in a JSON body."""
+    if not content or b'"reasoning"' not in content:
+        return content
+    try:
+        payload = json.loads(content)
+    except Exception:
+        return content
+    if not isinstance(payload, dict):
+        return content
+    changed = False
+    for choice in payload.get("choices") or []:
+        if isinstance(choice, dict):
+            changed |= _normalize_reasoning_field(choice.get("message") or {})
+    if not changed:
+        return content
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _relay_sse_chunks(chunks, write) -> None:
+    """Relay SSE chunks line by line so each frame can be normalized.
+
+    Upstream chunk boundaries are arbitrary (they can split a line or a
+    multi-byte character), so bytes are accumulated until a newline arrives.
+    """
+    pending = b""
+    for chunk in chunks:
+        if not chunk:
+            continue
+        pending += chunk
+        while True:
+            cut = pending.find(b"\n")
+            if cut < 0:
+                break
+            line, pending = pending[:cut], pending[cut + 1:]
+            write(_normalize_openai_stream_reasoning_line(line) + b"\n")
+    if pending:
+        write(_normalize_openai_stream_reasoning_line(pending))
+
+
 def _normalize_openai_stream_reasoning_line(line: object) -> object:
     """Rename ``reasoning`` deltas to ``reasoning_content`` and split mixed frames.
 
@@ -16427,6 +16467,8 @@ def run_llamaswap_guard(args) -> int:
                 
             if upstream.headers.get("Content-Length") is not None:
                 content = upstream.content
+                if "application/json" in (upstream.headers.get("Content-Type") or "").lower():
+                    content = _normalize_openai_json_reasoning_body(content)
                 self.send_header("Content-Length", str(len(content)))
                 self.end_headers()
                 if self.command != "HEAD":
@@ -16434,6 +16476,13 @@ def run_llamaswap_guard(args) -> int:
                 return
             self.end_headers()
             if self.command == "HEAD":
+                return
+            if "text/event-stream" in (upstream.headers.get("Content-Type") or "").lower():
+                def _write_sse(payload: bytes) -> None:
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+
+                _relay_sse_chunks(upstream.iter_content(chunk_size=None), _write_sse)
                 return
             for chunk in upstream.iter_content(chunk_size=None):
                 if chunk:
