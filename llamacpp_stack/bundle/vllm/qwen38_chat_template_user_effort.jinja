@@ -46,8 +46,10 @@
 {%- if enable_thinking is undefined or enable_thinking is true %}
     {#- Only inject a reasoning instruction when the client asks for one. #}
     {%- set resolved_reasoning_effort = reasoning_effort|default('') %}
-    {%- if resolved_reasoning_effort not in ('', 'xhigh', 'medium', 'low') %}
-        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh, medium, and low.') }}
+    {#- OpenAI uses low/medium/high; Qwen calls the top tier xhigh. -#}
+    {%- if resolved_reasoning_effort == 'high' %}{%- set resolved_reasoning_effort = 'xhigh' %}{%- endif %}
+    {%- if resolved_reasoning_effort not in ('', 'xhigh', 'medium', 'low', 'none') %}
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are low, medium, high/xhigh, none.') }}
     {%- endif %}
     {%- if resolved_reasoning_effort == 'xhigh' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
