@@ -488,6 +488,7 @@ def resolve_request_reasoning_budget(payload: dict[str, object], model, *, serve
         backend = "llama.cpp"
     if not isinstance(payload, dict) or backend not in {"llama.cpp", "vllm"}:
         return None, "unsupported_backend"
+    from .constants import DEFAULT_VLLM_GENERATION_LIMIT
     if any(k in payload for k in {"thinking_budget_tokens","reasoning_budget_tokens","thinking_token_budget"}):
         return None, "explicit_client_control"
     if backend == "vllm":
@@ -537,6 +538,10 @@ def resolve_request_reasoning_budget(payload: dict[str, object], model, *, serve
     if rl is None:
         rl = _positive_int(payload.get("max_completion_tokens"))
     cp = _positive_int(effective.get("predict"))
+    if cp is None and backend == "vllm":
+        # vLLM has no `predict`; use the same generation cap llama.cpp gets
+        # from its family defaults so both budgets are computed identically.
+        cp = DEFAULT_VLLM_GENERATION_LIMIT
     lims = [x for x in (rl, cp) if x]
     gen_lim = min(lims) if lims else None
     try:
@@ -557,16 +562,6 @@ def resolve_request_reasoning_budget(payload: dict[str, object], model, *, serve
     from .constants import MODEL_PROBE_REASONING_MAX_TOKENS, DEFAULT_REASONING_VISIBLE_RESERVE
     if is_probe and rl is not None and rl <= MODEL_PROBE_REASONING_MAX_TOKENS:
         return 0, "model_probe"
-    if backend == "vllm":
-        # In vLLM thinking and visible content share max_tokens, and the
-        # llama.cpp reserve (sized against --predict) is too small for short
-        # requests: 700 max_tokens used to leave only ~87 for the answer.
-        # Keep a third of the allowance for visible output.
-        if gen_lim is None:
-            return half, "half_context"
-        budget = max(0, min(half, gen_lim // 2))
-        reason = "half_generation_limit" if budget < half else "half_context"
-        return budget, reason
     if gen_lim is None:
         return half, "half_context"
     reserve = min(DEFAULT_REASONING_VISIBLE_RESERVE, max(1, gen_lim // 8))

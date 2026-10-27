@@ -7195,8 +7195,28 @@ models:
             model,
             server_defaults={"reasoning_budget": "half_context"},
         )
-        self.assertEqual(budget, 350)
-        self.assertEqual(reason, "half_generation_limit")
+        # Same reserve formula as llama.cpp: min(1024, max(1, 700 // 8)) = 87.
+        self.assertEqual(budget, 613)
+        self.assertEqual(reason, "half_context_clamped_to_generation_limit")
+
+    def test_vllm_budget_without_max_tokens_matches_llama_cpp_default(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-vllm",
+            repo_id="org/qwen",
+            quant="INT4",
+            filename="",
+            local_path="/models/qwen-vllm",
+            ctx_size=262144,
+            backend="vllm",
+        )
+        budget, reason = resolve_request_reasoning_budget(
+            {"model": model.model_id, "messages": [{"role": "user", "content": "write"}]},
+            model,
+            server_defaults={"reasoning_budget": "half_context"},
+        )
+        # 16384 (llama.cpp `predict` default) - 1024 reserve = 15360.
+        self.assertEqual(budget, 15360)
+        self.assertEqual(reason, "half_context_clamped_to_generation_limit")
 
     def test_vllm_explicit_thinking_token_budget_is_client_control(self) -> None:
         model = ManagedModel(

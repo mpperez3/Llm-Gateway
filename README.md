@@ -367,9 +367,16 @@ mechanism differs per engine:
 | Layer | llama.cpp / buun | vLLM |
 | --- | --- | --- |
 | Per-request field | `thinking_budget_tokens` | `thinking_token_budget` |
-| Budget split | `min(half_ctx, max_tokens - max(1, max_tokens/8))` | `min(half_ctx, max_tokens // 2)` |
+| Budget split | `min(half_ctx, gen_lim - min(1024, max(1, gen_lim/8)))` | same formula |
 | Forced close | `--reasoning-budget-message` + the family end token | `--reasoning-config '{"reasoning_end_str": ...}'` |
 | Stream field | `delta.reasoning_content` | `delta.reasoning`, renamed by the gateway |
+
+Both backends derive the budget the same way: `gen_lim` is the smallest of the
+client's `max_tokens` and the family generation cap (`predict`, 16384 by
+default), and roughly an eighth of it is reserved for visible output. vLLM has
+no `predict` flag, so it falls back to the same 16384
+(`DEFAULT_VLLM_GENERATION_LIMIT`) to keep the numbers identical. With
+`max_tokens=700` both pick 613 thinking tokens and leave 87 for the answer.
 
 vLLM 0.32 has the budget natively (`vllm/config/reasoning.py::ReasoningConfig`
 plus `ThinkingBudgetStateHolder`) and it works with speculative decoding. Custom
