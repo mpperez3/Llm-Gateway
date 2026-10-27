@@ -486,30 +486,49 @@ def resolve_request_reasoning_budget(payload: dict[str, object], model, *, serve
         backend = fn(model) if fn else "llama.cpp"
     except Exception:
         backend = "llama.cpp"
-    if not isinstance(payload, dict) or backend != "llama.cpp":
+    if not isinstance(payload, dict) or backend not in {"llama.cpp", "vllm"}:
         return None, "unsupported_backend"
-    if any(k in payload for k in {"thinking_budget_tokens","reasoning_budget_tokens"}):
+    if any(k in payload for k in {"thinking_budget_tokens","reasoning_budget_tokens","thinking_token_budget"}):
         return None, "explicit_client_control"
-    # effective options via lazy
-    try:
-        cf = _get_cli_file()
-        fn_eff = getattr(cf, "_effective_llama_server_options", None)
-        if fn_eff:
-            effective = fn_eff(model, server_defaults)
-        else:
+    if backend == "vllm":
+        # vLLM takes the budget as a per-request API field
+        # (`thinking_token_budget`); the server needs `--reasoning-parser` so
+        # ReasoningConfig can tokenize the start/end markers.
+        try:
+            effective = resolve_vllm_options(model, server_defaults)
+        except Exception:
+            effective = dict(server_defaults or {})
+    else:
+        # effective options via lazy
+        try:
+            cf = _get_cli_file()
+            fn_eff = getattr(cf, "_effective_llama_server_options", None)
+            if fn_eff:
+                effective = fn_eff(model, server_defaults)
+            else:
+                effective = dict(normalize_server_overrides(server_defaults or {}))
+                try:
+                    fn_fam = getattr(cf, "_family_defaults_for_model", None)
+                    fd = effective.pop("__family_defaults", None)
+                    if fn_fam:
+                        effective.update(fn_fam(model, fd))
+                except Exception:
+                    pass
+                effective.update(normalize_server_overrides(getattr(model, "server_overrides", {}) or {}))
+        except Exception:
             effective = dict(normalize_server_overrides(server_defaults or {}))
-            try:
-                fn_fam = getattr(cf, "_family_defaults_for_model", None)
-                fd = effective.pop("__family_defaults", None)
-                if fn_fam:
-                    effective.update(fn_fam(model, fd))
-            except Exception:
-                pass
             effective.update(normalize_server_overrides(getattr(model, "server_overrides", {}) or {}))
-    except Exception:
-        effective = dict(normalize_server_overrides(server_defaults or {}))
-        effective.update(normalize_server_overrides(getattr(model, "server_overrides", {}) or {}))
     policy = effective.get("reasoning_budget")
+    if isinstance(policy, bool):
+        return None, "fixed_or_unconfigured"
+    if isinstance(policy, (int, float)):
+        return max(0, int(policy)), "fixed"
+    if isinstance(policy, str):
+        ps = policy.strip().casefold()
+        if ps.isdigit():
+            return int(ps), "fixed"
+        if ps in {"off", "none", "disabled"}:
+            return None, "reasoning_disabled"
     if not (isinstance(policy, str) and policy.casefold() == REASONING_BUDGET_HALF_CONTEXT):
         return None, "fixed_or_unconfigured"
     if str(effective.get("reasoning") or "").strip().casefold() == "off":
@@ -538,6 +557,16 @@ def resolve_request_reasoning_budget(payload: dict[str, object], model, *, serve
     from .constants import MODEL_PROBE_REASONING_MAX_TOKENS, DEFAULT_REASONING_VISIBLE_RESERVE
     if is_probe and rl is not None and rl <= MODEL_PROBE_REASONING_MAX_TOKENS:
         return 0, "model_probe"
+    if backend == "vllm":
+        # In vLLM thinking and visible content share max_tokens, and the
+        # llama.cpp reserve (sized against --predict) is too small for short
+        # requests: 700 max_tokens used to leave only ~87 for the answer.
+        # Keep a third of the allowance for visible output.
+        if gen_lim is None:
+            return half, "half_context"
+        budget = max(0, min(half, gen_lim // 2))
+        reason = "half_generation_limit" if budget < half else "half_context"
+        return budget, reason
     if gen_lim is None:
         return half, "half_context"
     reserve = min(DEFAULT_REASONING_VISIBLE_RESERVE, max(1, gen_lim // 8))
@@ -788,7 +817,9 @@ def build_vllm_server_command(model, *, port: str, host: str | None = None, vllm
     resolved_host = str(options.pop("host", host or model.host) or "127.0.0.1")
     if resolved_host:
         command.extend(["--host", resolved_host])
-    reserved = {"model","port","served_model_name","host"}
+    # reasoning_budget/reasoning_budget_message are gateway policies consumed
+    # by resolve_request_reasoning_budget, not vLLM CLI flags.
+    reserved = {"model","port","served_model_name","host","reasoning_budget","reasoning_budget_message"}
     for rk, val in options.items():
         k = str(rk).strip().lower().replace("-", "_")
         if not k or k in reserved or val is None:

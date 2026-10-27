@@ -18713,29 +18713,43 @@ def start_ctx_metadata_server(args):
             if "max_tokens" not in upstream_payload and "max_completion_tokens" in upstream_payload:
                 upstream_payload["max_tokens"] = upstream_payload.get("max_completion_tokens")
 
-            if model_entry is not None and _model_backend(model_entry) == "llama.cpp":
-                active_server_defaults = resolve_llama_server_defaults(args)
-                reasoning_budget, reasoning_budget_reason = resolve_request_reasoning_budget(
-                    payload,
-                    model_entry,
-                    server_defaults=active_server_defaults,
-                )
-                if reasoning_budget is not None:
-                    upstream_payload["thinking_budget_tokens"] = reasoning_budget
-                    log_api_event(
-                        "openai_reasoning_budget_applied",
-                        {
-                            "request_id": request_id,
-                            "model": model_name,
-                            "upstream_model": upstream_model_name,
-                            "configured_context": displayed_configured_ctx(model_entry),
-                            "half_context": displayed_configured_ctx(model_entry) // 2,
-                            "applied_budget": reasoning_budget,
-                            "request_max_tokens": payload.get("max_tokens", payload.get("max_completion_tokens")),
-                            "configured_predict": _effective_llama_server_options(model_entry, active_server_defaults).get("predict"),
-                            "reason": reasoning_budget_reason,
-                        },
+            if model_entry is not None:
+                _rb_backend = _model_backend(model_entry)
+                _rb_field = None
+                _rb_defaults = None
+                if _rb_backend == "llama.cpp":
+                    # llama.cpp consumes the policy server-side.
+                    _rb_field = "thinking_budget_tokens"
+                    _rb_defaults = resolve_llama_server_defaults(args)
+                elif _rb_backend == "vllm":
+                    # vLLM reads `thinking_token_budget` per request and forces
+                    # the reasoning end tokens natively (works with spec-decode).
+                    _rb_field = "thinking_token_budget"
+                    _rb_defaults = resolve_vllm_defaults(args)
+                if _rb_field is not None and _rb_defaults is not None:
+                    reasoning_budget, reasoning_budget_reason = resolve_request_reasoning_budget(
+                        payload,
+                        model_entry,
+                        server_defaults=_rb_defaults,
                     )
+                    if reasoning_budget is not None:
+                        upstream_payload[_rb_field] = reasoning_budget
+                        log_api_event(
+                            "openai_reasoning_budget_applied",
+                            {
+                                "request_id": request_id,
+                                "model": model_name,
+                                "upstream_model": upstream_model_name,
+                                "backend": _rb_backend,
+                                "upstream_field": _rb_field,
+                                "configured_context": displayed_configured_ctx(model_entry),
+                                "half_context": displayed_configured_ctx(model_entry) // 2,
+                                "applied_budget": reasoning_budget,
+                                "request_max_tokens": payload.get("max_tokens", payload.get("max_completion_tokens")),
+                                "configured_predict": (_effective_llama_server_options(model_entry, _rb_defaults).get("predict") if _rb_backend == "llama.cpp" else None),
+                                "reason": reasoning_budget_reason,
+                            },
+                        )
             
             # Use explicit CLI flag if provided, otherwise fall back to server config
             flatten_enabled = True

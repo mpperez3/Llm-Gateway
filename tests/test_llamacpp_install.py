@@ -7156,6 +7156,60 @@ models:
         self.assertIsNone(budget)
         self.assertEqual(reason, "explicit_client_control")
 
+    def test_vllm_reasoning_budget_splits_generation_limit(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-vllm",
+            repo_id="org/qwen",
+            quant="INT4",
+            filename="",
+            local_path="/models/qwen-vllm",
+            ctx_size=262144,
+            backend="vllm",
+        )
+        budget, reason = resolve_request_reasoning_budget(
+            {"model": model.model_id, "messages": [{"role": "user", "content": "write"}], "max_tokens": 700},
+            model,
+            server_defaults={"reasoning_budget": "half_context"},
+        )
+        self.assertEqual(budget, 350)
+        self.assertEqual(reason, "half_generation_limit")
+
+    def test_vllm_explicit_thinking_token_budget_is_client_control(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-vllm",
+            repo_id="org/qwen",
+            quant="INT4",
+            filename="",
+            local_path="/models/qwen-vllm",
+            ctx_size=262144,
+            backend="vllm",
+        )
+        budget, reason = resolve_request_reasoning_budget(
+            {"messages": [{"role": "user", "content": "write"}], "thinking_token_budget": 64},
+            model,
+            server_defaults={"reasoning_budget": "half_context"},
+        )
+        self.assertIsNone(budget)
+        self.assertEqual(reason, "explicit_client_control")
+
+    def test_vllm_reasoning_off_omits_request_budget(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-vllm",
+            repo_id="org/qwen",
+            quant="INT4",
+            filename="",
+            local_path="/models/qwen-vllm",
+            ctx_size=262144,
+            backend="vllm",
+        )
+        budget, reason = resolve_request_reasoning_budget(
+            {"messages": [{"role": "user", "content": "write"}], "max_tokens": 700},
+            model,
+            server_defaults={"reasoning_budget": "half_context", "reasoning": "off"},
+        )
+        self.assertIsNone(budget)
+        self.assertEqual(reason, "reasoning_disabled")
+
     def test_chat_tool_loop_guard_scales_char_cap_with_thinking_budget(self) -> None:
         from llamacpp_stack.cli import _chat_tool_continue_loop_guard_reason
 

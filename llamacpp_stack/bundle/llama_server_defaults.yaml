@@ -108,7 +108,10 @@ buun:
 # vLLM defaults are kept separate from llama.cpp flags. They are applied only
 # to catalog entries whose backend is `vllm`.
 vllm:
-  defaults: {}
+  defaults:
+    # Gateway policy, not a vLLM flag: half the configured context, then
+    # clamped to 2/3 of max_tokens so the visible answer always has room.
+    reasoning_budget: half_context
   family_defaults:
     qwen3.6:
       # Same serving intent as the Qwen3.6 GGUF profile below: one scheduled
