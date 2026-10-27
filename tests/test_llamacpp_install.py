@@ -7156,6 +7156,30 @@ models:
         self.assertIsNone(budget)
         self.assertEqual(reason, "explicit_client_control")
 
+    def test_vllm_reasoning_delta_is_exposed_as_reasoning_content(self) -> None:
+        from llamacpp_stack._cli_impl import _normalize_openai_stream_reasoning_line
+
+        raw = b'data: {"choices":[{"index":0,"delta":{"reasoning":"hola"},"finish_reason":null}]}'
+        out = _normalize_openai_stream_reasoning_line(raw)
+        payload = json.loads(out[6:])
+        delta = payload["choices"][0]["delta"]
+        self.assertEqual(delta.get("reasoning_content"), "hola")
+        self.assertNotIn("reasoning", delta)
+
+    def test_non_reasoning_stream_line_is_untouched(self) -> None:
+        from llamacpp_stack._cli_impl import _normalize_openai_stream_reasoning_line
+
+        raw = b'data: {"choices":[{"index":0,"delta":{"content":"hola"},"finish_reason":null}]}'
+        self.assertIs(_normalize_openai_stream_reasoning_line(raw), raw)
+
+    def test_vllm_message_reasoning_is_exposed_as_reasoning_content(self) -> None:
+        from llamacpp_stack._cli_impl import _normalize_reasoning_field
+
+        message = {"role": "assistant", "content": "x", "reasoning": "pensando"}
+        _normalize_reasoning_field(message)
+        self.assertEqual(message.get("reasoning_content"), "pensando")
+        self.assertNotIn("reasoning", message)
+
     def test_vllm_reasoning_budget_splits_generation_limit(self) -> None:
         model = ManagedModel(
             model_id="qwen-vllm",

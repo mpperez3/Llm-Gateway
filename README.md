@@ -359,6 +359,57 @@ and a null value represents a valueless flag. The installed llama-server
 still decides whether a flag is valid; use `config-keys` and the diagnostic
 commands to catch unsupported options before loading a model.
 
+### vLLM reasoning parity (budget, forced close, `reasoning_content`)
+
+The backend-neutral `reasoning_budget` policy also applies to vLLM, but the
+mechanism differs per engine:
+
+| Layer | llama.cpp / buun | vLLM |
+| --- | --- | --- |
+| Per-request field | `thinking_budget_tokens` | `thinking_token_budget` |
+| Budget split | `min(half_ctx, max_tokens - max(1, max_tokens/8))` | `min(half_ctx, max_tokens // 2)` |
+| Forced close | `--reasoning-budget-message` + the family end token | `--reasoning-config '{"reasoning_end_str": ...}'` |
+| Stream field | `delta.reasoning_content` | `delta.reasoning`, renamed by the gateway |
+
+vLLM 0.32 has the budget natively (`vllm/config/reasoning.py::ReasoningConfig`
+plus `ThinkingBudgetStateHolder`) and it works with speculative decoding. Custom
+logits processors are **not** an alternative: vLLM rejects them when DFlash/MTP
+speculative decoding is enabled. The server only needs `--reasoning-parser` for
+the family, which the bundled Qwen families already set.
+
+The forced close lives in the **model** override, not in a global default,
+because the end marker is family-specific (`</think>` for Qwen):
+
+```json
+{
+  "model_id": "Qwen3.8-27B-AutoRound-INT4-[vLLM]",
+  "server_overrides": {
+    "vllm": {
+      "reasoning_config": {
+        "reasoning_end_str": "\n\nOkay, I have thought enough. I will now provide the final answer.\n</think>\n\n"
+      }
+    }
+  }
+}
+```
+
+Re-apply it with the idempotent helper (dry-run by default):
+
+```console
+$ python tools/patch_vllm_reasoning.py --list
+$ python tools/patch_vllm_reasoning.py --model 'Qwen3.8-27B-AutoRound-INT4-[vLLM]'          # dry run
+$ python tools/patch_vllm_reasoning.py --model 'Qwen3.8-27B-AutoRound-INT4-[vLLM]' --apply
+# system installation: add --system; keep the units running with --no-restart
+```
+
+`--apply` writes the catalog (timestamped backup), runs `llm-server update` and
+restarts the units. It is a *server flag* change, so it costs one model reload;
+never do it by writing `config.yaml` at runtime, which drops every loaded model.
+
+Clients see a single reasoning spelling. vLLM emits `delta.reasoning`; the
+gateway renames it to `reasoning_content` (streaming and non-streaming) so the
+same client code works against llama.cpp, buun and vLLM.
+
 ### Conversation replicas
 
 Replicas are disabled by default and are controlled globally. They are

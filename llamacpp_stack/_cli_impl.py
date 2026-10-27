@@ -12845,6 +12845,59 @@ def _normalize_openai_message(message: dict, preserve_reasoning_content: bool = 
     return normalized
 
 
+def _normalize_reasoning_field(
+    payload: dict,
+    *,
+    canonical: str = "reasoning_content",
+    drop: tuple[str, ...] = ("reasoning",),
+) -> bool:
+    """Expose one canonical reasoning field to clients.
+
+    vLLM 0.32 streams ``delta.reasoning`` / returns ``message.reasoning``
+    (the newer OpenAI field name) while llama.cpp and buun emit
+    ``reasoning_content``. Clients are written against the llama.cpp shape,
+    so the gateway renames the vLLM field instead of leaking two spellings
+    from the same API.
+    """
+    if not isinstance(payload, dict):
+        return False
+    changed = False
+    for key in drop:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if not payload.get(canonical):
+            payload[canonical] = value if value is not None else ""
+        payload.pop(key, None)
+        changed = True
+    return changed
+
+
+def _normalize_openai_stream_reasoning_line(line: object) -> object:
+    """Rename ``reasoning`` deltas to ``reasoning_content`` in one SSE line."""
+    is_bytes = isinstance(line, (bytes, bytearray))
+    text = bytes(line).decode("utf-8", errors="ignore") if is_bytes else str(line or "")
+    if not text.startswith("data: ") or '"reasoning"' not in text:
+        return line
+    raw = text[6:].strip()
+    if raw in ("", "[DONE]"):
+        return line
+    try:
+        chunk = json.loads(raw)
+    except Exception:
+        return line
+    changed = False
+    for choice in chunk.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        changed |= _normalize_reasoning_field(choice.get("delta") or {})
+        changed |= _normalize_reasoning_field(choice.get("message") or {})
+    if not changed:
+        return line
+    normalized = "data: " + json.dumps(chunk, ensure_ascii=False, separators=(",", ":"))
+    return normalized.encode("utf-8") if is_bytes else normalized
+
+
 def _parse_chat_template_kwargs(value: object) -> dict[str, object]:
     if isinstance(value, dict):
         return dict(value)
@@ -19160,6 +19213,7 @@ def start_ctx_metadata_server(args):
                     except Exception:
                         pass
                     for line in response.iter_lines():
+                        line = _normalize_openai_stream_reasoning_line(line)
                         if _openai_stream_tee is not None:
                             try:
                                 _openai_stream_tee.append(line if isinstance(line, bytes) else str(line).encode("utf-8"))  # type: ignore
@@ -19462,11 +19516,12 @@ def start_ctx_metadata_server(args):
                 "choices": [
                     {
                         "index": 0,
-                        "message": choice.get("message") or {"role": "assistant", "content": ""},
+                        "message": dict(choice.get("message") or {"role": "assistant", "content": ""}),
                         "finish_reason": choice.get("finish_reason") or "stop",
                     }
                 ],
             }
+            _normalize_reasoning_field(final_payload["choices"][0]["message"])
             if data.get("usage") is not None:
                 final_payload["usage"] = data.get("usage")
             if data.get("timings") is not None:
