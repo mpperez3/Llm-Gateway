@@ -18683,6 +18683,28 @@ def start_ctx_metadata_server(args):
             upstream_payload = dict(payload)
             upstream_payload["model"] = upstream_route_id
             upstream_payload["messages"] = messages
+            # Repetition guard: a previous generation degenerated -> tell the model.
+            _rg_cfg = {"enabled": False}
+            try:
+                if str(self.headers.get("X-LLM-Server-Guard", "") or "").strip().lower() == "off":
+                    raise RuntimeError("guard disabled by header")
+                from .cli.repetition_guard import load_config as _rg_load_cfg, pop_pending_note as _rg_pop_note
+                _rg_cfg = _rg_load_cfg()
+                _rg_conv_key = ""
+                try:
+                    from .cli.repetition_guard import conversation_key as _rg_conv_fn
+                    _rg_conv_key = _rg_conv_fn(upstream_payload)
+                except Exception:
+                    _rg_conv_key = ""
+                if _rg_cfg.get("enabled"):
+                    _rg_note_text = _rg_pop_note(model_name, _rg_conv_key)
+                    if _rg_note_text:
+                        upstream_payload["messages"] = list(upstream_payload.get("messages") or []) + [
+                            {"role": "system", "content": _rg_note_text}
+                        ]
+                        log_api_event("openai_chat_repetition_note_injected", {"request_id": request_id, "model": model_name})
+            except Exception:
+                _rg_cfg = {"enabled": False}
             upstream_payload.setdefault("cache_prompt", True)
             # OpenAI-compatible clients use both spellings. llama.cpp uses
             # max_tokens for the generation cap; normalize before deriving a
@@ -19111,6 +19133,18 @@ def start_ctx_metadata_server(args):
                 except Exception:
                     _dv_on = False
                 try:
+                    _rg_state = {"hit": False, "buffering": True, "bytes": 0, "lines": [], "retried": False}
+                    _rg_detector = None
+                    try:
+                        if _rg_cfg.get("enabled"):
+                            from .cli.repetition_guard import RepetitionDetector as _RGDet
+                            _rg_detector = _RGDet(_rg_cfg)
+                    except Exception:
+                        _rg_detector = None
+                    try:
+                        log_api_event("openai_chat_repetition_armed", {"request_id": request_id, "enabled": bool(_rg_cfg.get("enabled")), "detector": _rg_detector is not None})
+                    except Exception:
+                        pass
                     for line in response.iter_lines():
                         if _openai_stream_tee is not None:
                             try:
@@ -19136,7 +19170,7 @@ def start_ctx_metadata_server(args):
                                         choice0 = (chunk_data.get("choices") or [{}])[0]
                                         delta = choice0.get("delta", {}) or {}
                                         content = delta.get("content", "") or ""
-                                        reasoning = delta.get("reasoning_content", "") or ""
+                                        reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
                                         tool_calls = delta.get("tool_calls") or []
                                         finish_reason = choice0.get("finish_reason")
                                         if finish_reason:
@@ -19155,6 +19189,11 @@ def start_ctx_metadata_server(args):
                                                     _tc_arg = ((_tc or {}).get("function") or {}).get("arguments")
                                                     if _tc_arg:
                                                         stream_tool_arg_parts.append(str(_tc_arg))
+                                        if _rg_detector is not None and not _rg_state["hit"]:
+                                            if _rg_detector.feed(str(reasoning or "") + str(content or "")):
+                                                _rg_state["hit"] = True
+                                            if content:
+                                                _rg_state["flush_now"] = True
                                         if content or reasoning or tool_calls or finish_reason:
                                             log_api_event("openai_chat_stream_chunk_received", {
                                                 "request_id": request_id,
@@ -19166,12 +19205,91 @@ def start_ctx_metadata_server(args):
                                             })
                                     except Exception:
                                         pass
-                                self.wfile.write(line + b"\n")
+                                if _rg_detector is not None and _rg_state["buffering"] and not _rg_state["hit"]:
+                                    _rg_state["lines"].append(line)
+                                    _rg_state["bytes"] += len(line)
+                                    if (
+                                        _rg_state.get("flush_now")
+                                        or (_rg_detector is not None and len(getattr(_rg_detector, "raw", "")) >= int(_rg_cfg.get("buffer_chars") or 6000))
+                                    ):
+                                        for _rg_l in _rg_state["lines"]:
+                                            self.wfile.write(_rg_l + b"\n")
+                                        _rg_state["lines"] = []
+                                        _rg_state["buffering"] = False
+                                else:
+                                    self.wfile.write(line + b"\n")
                             else:
                                 self.wfile.write(b"\n")
                             self.wfile.flush()
                         if line and line.startswith(b"data: "):
                             mark_model_activity(model_name, "openai_chat", "stream_chunk", log=False)
+                    if _rg_detector is not None and _rg_state["buffering"] and not _rg_state["hit"]:
+                        with write_lock:
+                            for _rg_l in _rg_state["lines"]:
+                                self.wfile.write(_rg_l + b"\n")
+                            self.wfile.flush()
+                        _rg_state["lines"] = []
+                    if _rg_state["hit"]:
+                        log_api_event("openai_chat_repetition_detected", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "stream": True})
+                        try:
+                            from .cli.repetition_guard import record_incident as _rg_record, build_retry_payload as _rg_build_retry
+                            _rg_record(model_name, "stream repetition detected", _rg_conv_key)
+                        except Exception:
+                            _rg_build_retry = None
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                        _rg_ok = False
+                        if _rg_cfg.get("retry") and not _rg_state["retried"] and _rg_build_retry is not None:
+                            _rg_state["retried"] = True
+                            try:
+                                _rg_payload = _rg_build_retry(upstream_payload, _rg_cfg)
+                                # Non-streaming retry: one JSON answer, re-emitted as SSE.
+                                # Avoids a nested SSE relay through the same proxy.
+                                _rg_payload["stream"] = False
+                                log_api_event("openai_chat_repetition_retry", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name})
+                                _rr = requests.post(
+                                    f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
+                                    data=json.dumps(_rg_payload).encode("utf-8"),
+                                    headers={"Content-Type": "application/json", "X-LLM-Server-Guard": "off"},
+                                    timeout=(60, 900),
+                                )
+                                log_api_event("openai_chat_repetition_retry_status", {"request_id": request_id, "model": model_name, "status": _rr.status_code, "body": _rr.text[:300]})
+                                if _rr.status_code < 400:
+                                    _rj = _rr.json()
+                                    _rmsg = ((_rj.get("choices") or [{}])[0].get("message") or {})
+                                    _rtxt = str(_rmsg.get("content") or "")
+                                    _rrsn = str(_rmsg.get("reasoning") or "")
+                                    if len(re.findall(r"\w+\(\d+\)", _rrsn + _rtxt)) >= 20:
+                                        log_api_event("openai_chat_repetition_retry_failed", {"request_id": request_id, "model": model_name})
+                                        try:
+                                            from .cli.repetition_guard import record_incident as _rg_record3
+                                            _rg_record3(model_name, "retry degenerated", _rg_conv_key)
+                                        except Exception:
+                                            pass
+                                    with write_lock:
+                                        for _i in range(0, len(_rtxt), 400):
+                                            _rc = {"choices": [{"index": 0, "delta": {"content": _rtxt[_i:_i + 400]}, "finish_reason": None}]}
+                                            self.wfile.write(b"data: " + json.dumps(_rc).encode("utf-8") + b"\n\n")
+                                        _rc = {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                                        self.wfile.write(b"data: " + json.dumps(_rc).encode("utf-8") + b"\n\n")
+                                        self.wfile.write(b"data: [DONE]\n\n")
+                                        self.wfile.flush()
+                                    _rg_ok = True
+                            except Exception as _rg_exc:
+                                log_api_event("openai_chat_repetition_retry_error", {"request_id": request_id, "model": model_name, "error": str(_rg_exc)})
+                        if not _rg_ok:
+                            with write_lock:
+                                self.wfile.write(b"data: [DONE]\n\n")
+                                self.wfile.flush()
+                        if upstream_model_name:
+                            REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                        try:
+                            _finish_openai_chat_request()
+                        except Exception:
+                            pass
+                        return
                 except (BrokenPipeError, ConnectionResetError, requests.RequestException) as exc:
                     log_api_event("openai_chat_stream_interrupted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "error": str(exc), "router_state": replica_trace_state_for_base(model_name)})
                 finally:

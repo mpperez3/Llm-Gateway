@@ -145,7 +145,44 @@ EOF
 - Revertir a MTP: `{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}`
   (el draft vocab 40 960 sigue en el modelo y se reutiliza).
 
-### Prefix cache y mensajes system inline (aplicado 2026-10-26)
+### Guard de repetición (aplicado 2026-10-27)
+
+El modelo AutoRound INT4 degenera en contextos largos cuando el prompt pide una
+longitud concreta ("unas 150 palabras"): enumera `palabra(12)`, `palabra(13)`… en el
+razonamiento y consume el presupuesto sin responder. EXL3/buun no lo hace (misma
+plantilla, distinto motor/cuantización; llama.cpp además tiene
+`--reasoning-budget-message`). La plantilla de ambos modelos es **idéntica**; el
+`reasoning_effort` ahora es pass-through (nuestra copia no fuerza `xhigh`).
+
+Guard en el gateway (`llamacpp_stack/cli/repetition_guard.py`), configurable en
+`conf.json`:
+
+```json
+"repetition_guard": {
+  "enabled": true,
+  "window_chars": 120, "min_repeats": 3, "min_chars": 600,
+  "max_count_patterns": 20,
+  "buffer_chars": 6000,
+  "retry": true, "retry_disable_thinking": true,
+  "retry_nudge": "La generación anterior entró en un bucle ...",
+  "notify_next": true, "notify_ttl_s": 900, "notify_count": 1
+}
+```
+
+Comportamiento:
+1. Detecta repetición exacta (misma ventana N veces) y el patrón `palabra(n)`.
+2. Aborta el stream antes de reenviar lo buffereado y **reintenta sin streaming**
+   con `enable_thinking=false` + nudge (`X-LLM-Server-Guard: off` evita recursión).
+3. Devuelve al cliente solo la respuesta del reintento (SSE sintetizado).
+4. Registra el incidente y **inyecta el aviso en la siguiente petición de la misma
+   conversación** (hash del primer mensaje de usuario), para que el modelo sepa que
+   hubo un problema.
+
+Verificado: detección + reintento → 1033 chars de respuesta coherente sin conteo;
+siguiente turno con aviso inyectado → sin bucle. El gateway corre en
+`llm-server-manager` (reiniciar ese servicio, no solo el router).
+
+## Prefix cache y mensajes system inline (aplicado 2026-10-26)
 
 **Síntoma**: los clientes agénticos (Claude Code y similares) ven peticiones
 lentas aunque el decode vaya a >100 tok/s. Los logs de vLLM lo dicen:
