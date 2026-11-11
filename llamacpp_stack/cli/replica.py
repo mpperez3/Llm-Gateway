@@ -1174,6 +1174,8 @@ def render_llamaswap_config(
             "ttl": int(idle_ttl),
         }
         entry["capabilities"] = route_capabilities(entry, m)
+        if str(getattr(m, "backend", "")).lower() == "ninfer":
+            entry["useModelName"] = _ninfer_upstream_name(m)
         data["models"][m.model_id] = entry
         if public_base_model_id is not None:
             data["models"][m.model_id]["metadata"] = {"internal_replica_of": public_base_model_id}
@@ -1190,6 +1192,8 @@ def render_llamaswap_config(
                     "ttl": int(idle_ttl),
                 }
                 variant_entry["capabilities"] = route_capabilities(variant_entry, m)
+                if str(getattr(m, "backend", "")).lower() == "ninfer":
+                    variant_entry["useModelName"] = _ninfer_upstream_name(m)
                 variant_entry["metadata"] = {
                     "route_variant_of": m.model_id,
                     "gpu_variant": variant_gpus[0],
@@ -1288,6 +1292,17 @@ def route_carries_mmproj(entry: object) -> bool:
         return "--mmproj" in str((entry or {}).get("cmd") or "")
     except Exception:
         return False
+
+
+def _ninfer_upstream_name(model: object) -> str:
+    """Model id the NInfer container serves; llama-swap must rewrite `model` to it."""
+    try:
+        overrides = getattr(model, "server_overrides", None) or {}
+        opts = overrides.get("ninfer") if isinstance(overrides, dict) else None
+        name = str((opts or {}).get("model_id") or "").strip()
+        return name or "qwen3.8-27b"
+    except Exception:
+        return "qwen3.8-27b"
 
 
 def route_capabilities(entry: object, model: object | None = None) -> dict[str, object]:
@@ -1397,6 +1412,8 @@ def ensure_internal_route_in_llamaswap_config(
             "description": description or getattr(model_for_route, "description", "") or route_id,
         }
         entry["capabilities"] = route_capabilities(entry, model_for_route)
+        if str(getattr(model_for_route, "backend", "")).lower() == "ninfer":
+            entry["useModelName"] = _ninfer_upstream_name(model_for_route)
 
         # Subset compare over every field this function owns. Comparing only the
         # mmproj state would silently drop a CVD-only or ttl-only edit.

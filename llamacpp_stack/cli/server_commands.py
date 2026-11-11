@@ -851,6 +851,38 @@ def _mmproj_enabled_for(model) -> bool:
         return True
 
 
+def build_ninfer_server_command(model, *, port: str) -> list[str]:
+    """NInfer-all runs in a container behind the `ninfer-server` wrapper.
+
+    Catalog overrides: server_overrides.ninfer = {gpu: 0|1, max_context, kv_dtype,
+    spec, draft_tokens, vision, gdn_state_fp16, max_concurrency, ...}. Keys are
+    rendered as --kebab-case flags for the wrapper (which forwards them to
+    `ninfer-serve`).
+    """
+    try:
+        overrides = getattr(model, "server_overrides", None) or {}
+        opts = dict(overrides.get("ninfer") or {}) if isinstance(overrides, dict) else {}
+    except Exception:
+        opts = {}
+    wrapper = os.environ.get("NINFER_SERVER_BIN", "ninfer-server")
+    cmd = [wrapper, "--port", str(port), "--artifact", str(model.local_path)]
+    gpu = opts.pop("gpu", 0)
+    cmd.extend(["--gpu", str(gpu)])
+    for key, value in opts.items():
+        flag = "--" + str(key).strip().lower().replace("_", "-")
+        if value is None or value is False:
+            continue
+        if value is True:
+            cmd.append(flag)
+            continue
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                cmd.extend([flag, str(item)])
+            continue
+        cmd.extend([flag, _vllm_flag_value(value)])
+    return cmd
+
+
 def build_llama_server_command(model, server_path: Path, *, port: str, host: str | None = None, include_model_path: bool = True, include_mmproj: bool = True, include_jinja: bool = True, server_defaults: dict[str, object] | None = None, vllm_defaults: dict[str, object] | None = None, extra_flags: list[str] | None = None) -> list[str]:
     try:
         cf = _get_cli_file()
@@ -860,6 +892,8 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
         backend = "llama.cpp"
     if backend == "vllm":
         return build_vllm_server_command(model, port=port, host=host, vllm_defaults=vllm_defaults)
+    if backend == "ninfer":
+        return build_ninfer_server_command(model, port=port)
     effective = dict(normalize_server_overrides(server_defaults or {}))
     fam = effective.pop("__family_defaults", None)
     try:

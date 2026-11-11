@@ -1036,6 +1036,41 @@ def resolve_tool_intent_capture_config(args = None) -> dict[str, object]:
     return cfg
 
 
+def _check_response_quality(*, request_id, model_name, upstream_model_name, messages, content, reasoning,
+                            finish_reason, tool_calls, chunk_sizes, params, elapsed_ms, stream):
+    """Clasifica respuestas degradadas y guarda el caso con su prompt (fail-open)."""
+    try:
+        from .cli.response_quality import analyze as _rq_analyze, load_config as _rq_load, save_case as _rq_save
+        _cfg = _rq_load()
+        if not _cfg.get("enabled"):
+            return
+        _prompt_parts = []
+        for _m in (messages or []):
+            _c = _m.get("content") if isinstance(_m, dict) else None
+            if isinstance(_c, list):
+                _c = " ".join(str(_p.get("text") or "") if isinstance(_p, dict) else str(_p) for _p in _c)
+            if _c:
+                _prompt_parts.append(str(_c))
+        _prompt_text = "\n".join(_prompt_parts)
+        _metrics = _rq_analyze(prompt_text=_prompt_text, content=content or "", reasoning=reasoning or "",
+                               finish_reason=finish_reason or "", tool_calls=tool_calls or 0,
+                               chunk_sizes=chunk_sizes, cfg=_cfg)
+        _flags = _metrics.get("flags") or []
+        if not _flags:
+            return
+        log_api_event("openai_chat_quality_flagged", {"request_id": request_id, "model": model_name,
+            "upstream_model": upstream_model_name, "flags": _flags, "metrics": _metrics,
+            "params": params, "elapsed_ms": elapsed_ms, "stream": stream})
+        _path = _rq_save(cfg=_cfg, payload={"request_id": request_id, "flags": _flags, "metrics": _metrics,
+            "model": model_name, "upstream_model": upstream_model_name, "params": params,
+            "elapsed_ms": elapsed_ms, "stream": stream},
+            prompt_text=_prompt_text, content=content or "", reasoning=reasoning or "")
+        if _path:
+            log_api_event("openai_chat_quality_saved", {"request_id": request_id, "path": _path, "flags": _flags})
+    except Exception:
+        pass
+
+
 def _capture_tool_intent_failure(
     args,
     *,
@@ -2602,6 +2637,8 @@ def _normalize_model_backend(value: object, filename: object = "", local_path: o
         return "vllm"
     if normalized in {"vllm", "vllm-beta"}:
         return "vllm"
+    if normalized in {"ninfer", "ninfer-all"}:
+        return "ninfer"
     if normalized in {"llama.cpp", "llama-cpp", "llamacpp"}:
         return "llama.cpp"
     local = Path(str(local_path or ""))
@@ -6764,6 +6801,34 @@ def maybe_build_draft_vocab_after_add(args) -> None:
         _build_draft_vocab_for_model(target)
     except Exception as exc:  # optional drafter head must never fail an add
         print(f"[draft-vocab] aviso: no se pudo generar el vocabulario de draft: {exc}", file=sys.stderr)
+
+
+def maintenance_command(args) -> int:
+    """Toggle maintenance mode and (optionally) the transparent redirect target."""
+    action = str(getattr(args, "action", "status") or "status").strip().lower()
+    target = (getattr(args, "model", None) or "").strip()
+    if action in {"on", "enable"}:
+        MAINTENANCE_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MAINTENANCE_FLAG_PATH.write_text("1\n", encoding="utf-8")
+        if target:
+            MAINTENANCE_TARGET_PATH.write_text(target + "\n", encoding="utf-8")
+        if target:
+            print(f"[maintenance] ON - todas las peticiones se redirigen a: {target}")
+        else:
+            print("[maintenance] ON - solo se aceptan peticiones locales")
+        return 0
+    if action in {"off", "disable"}:
+        for p in (MAINTENANCE_FLAG_PATH, MAINTENANCE_TARGET_PATH):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+        print("[maintenance] OFF")
+        return 0
+    active = _maintenance_flag_active()
+    current = _maintenance_target_model() if active else None
+    print(f"[maintenance] {'ON' if active else 'OFF'}" + (f" -> {current}" if current else ""))
+    return 0
 
 
 def print_config_keys(args) -> int:
@@ -16386,7 +16451,10 @@ def run_llamaswap_guard(args) -> int:
                 return
             length = int(self.headers.get("Content-Length") or "0")
             body = self.rfile.read(length) if length > 0 else None
-            target_url = f"http://{backend_host}:{backend_port}{self.path}"
+            asset_path = self.path
+            if asset_path.startswith("/assets/") or asset_path in {"/site.webmanifest", "/favicon.ico"}:
+                asset_path = "/ui" + asset_path
+            target_url = f"http://{backend_host}:{backend_port}{asset_path}"
             try:
                 upstream = requests.request(
                     self.command,
@@ -17141,6 +17209,28 @@ def _is_loopback_client(host: str) -> bool:
 
 
 MAINTENANCE_FLAG_PATH = DEFAULT_REQUESTS_LOG_PATH.with_name("maintenance")
+MAINTENANCE_TARGET_PATH = MAINTENANCE_FLAG_PATH.with_name("maintenance-target")
+
+
+def _maintenance_target_model(catalog=None) -> str | None:
+    """Model every request is redirected to while maintenance mode is active.
+
+    Written by `llm-server maintenance on --model ID`. When set, the gateway stops
+    rejecting remote clients and rewrites the requested model to this one, so any
+    client keeps working while the rest of the stack is being worked on.
+    """
+    try:
+        if not _maintenance_flag_active() or not MAINTENANCE_TARGET_PATH.exists():
+            return None
+        name = MAINTENANCE_TARGET_PATH.read_text(encoding="utf-8").strip()
+        if not name:
+            return None
+        if catalog is not None:
+            resolved = resolve_catalog_model_name(name, catalog)
+            return resolved or None
+        return name
+    except Exception:
+        return None
 
 
 def _maintenance_flag_active() -> bool:
@@ -17389,6 +17479,10 @@ def start_ctx_metadata_server(args):
         def _maintenance_gate(self) -> bool:
             try:
                 if not _maintenance_flag_active():
+                    return False
+                # With a redirect target every request is served by one model, so
+                # remote clients are not rejected.
+                if _maintenance_target_model() is not None:
                     return False
                 host = self.client_address[0] if getattr(self, "client_address", None) else ""
                 return not _is_loopback_client(host)
@@ -18208,6 +18302,10 @@ def start_ctx_metadata_server(args):
                 log_api_event("dedup_bypass_disabled", {"reason": _dedup_bypass_oc, "path": self.path.split("?", 1)[0]})
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
+            _maint_target = _maintenance_target_model(catalog)
+            if _maint_target:
+                model_name = _maint_target
+                payload["model"] = model_name
             if not model_name:
                 self._send_json({"error": "model is required"}, status=400)
                 return
@@ -18533,6 +18631,10 @@ def start_ctx_metadata_server(args):
             started_at = time.monotonic()
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
+            _maint_target = _maintenance_target_model(catalog)
+            if _maint_target:
+                model_name = _maint_target
+                payload["model"] = model_name
             if not model_name:
                 self._send_json({"error": {"message": "model is required", "type": "invalid_request_error"}}, status=400)
                 return
@@ -19289,6 +19391,16 @@ def start_ctx_metadata_server(args):
                 heartbeat_thread.daemon = True
                 heartbeat_thread.start()
 
+                _stream_dump: list[bytes] = []
+                _stream_dump_bytes = 0
+
+                def _stream_write(payload: bytes) -> None:
+                    nonlocal _stream_dump_bytes
+                    if _stream_dump_bytes < 65536:
+                        _stream_dump.append(payload)
+                        _stream_dump_bytes += len(payload)
+                    self.wfile.write(payload)
+
                 first_chunk_logged = False
                 stream_visible_content_len = 0
                 stream_reasoning_len = 0
@@ -19314,7 +19426,39 @@ def start_ctx_metadata_server(args):
                         log_api_event("openai_chat_repetition_armed", {"request_id": request_id, "enabled": bool(_rg_cfg.get("enabled")), "detector": _rg_detector is not None})
                     except Exception:
                         pass
+                    _sc_cfg = {"enabled": False}
+                    _sc_detector = None
+                    _sc_state = {"tripped": False}
+                    try:
+                        from .cli.stream_canary import load_config as _sc_load_cfg, SoupDetector as _SCDet
+                        _sc_cfg = _sc_load_cfg()
+                        if _sc_cfg.get("enabled"):
+                            _sc_detector = _SCDet(_sc_cfg)
+                    except Exception:
+                        _sc_cfg = {"enabled": False}
+                        _sc_detector = None
+                    def _emit_line(_line: bytes) -> None:
+                        if _rg_detector is not None and _rg_state["buffering"] and not _rg_state["hit"]:
+                            _rg_state["lines"].append(_line)
+                            _rg_state["bytes"] += len(_line)
+                            if (
+                                _rg_state.get("flush_now")
+                                or len(getattr(_rg_detector, "raw", "")) >= int(_rg_cfg.get("buffer_chars") or 6000)
+                            ):
+                                for _rg_l in _rg_state["lines"]:
+                                    _stream_write(_rg_l + b"\n")
+                                _rg_state["lines"] = []
+                                _rg_state["buffering"] = False
+                        else:
+                            _stream_write(_line + b"\n")
+
                     for line in response.iter_lines():
+                        if _sc_state["tripped"] and _sc_cfg.get("enforce", True):
+                            try:
+                                response.close()
+                            except Exception:
+                                pass
+                            break
                         line = _normalize_openai_stream_reasoning_line(line)
                         if _openai_stream_tee is not None:
                             try:
@@ -19364,6 +19508,19 @@ def start_ctx_metadata_server(args):
                                                 _rg_state["hit"] = True
                                             if content:
                                                 _rg_state["flush_now"] = True
+                                        if _sc_detector is not None and not _sc_state["tripped"]:
+                                            if _sc_detector.feed(str(reasoning or "") + str(content or "")):
+                                                _sc_state["tripped"] = True
+                                                try:
+                                                    log_api_event("openai_chat_stream_canary_tripped", {
+                                                        "request_id": request_id,
+                                                        "model": model_name,
+                                                        "upstream_model": upstream_model_name,
+                                                        "enforce": bool(_sc_cfg.get("enforce", True)),
+                                                        **_sc_detector.stats(),
+                                                    })
+                                                except Exception:
+                                                    pass
                                         if content or reasoning or tool_calls or finish_reason:
                                             log_api_event("openai_chat_stream_chunk_received", {
                                                 "request_id": request_id,
@@ -19375,21 +19532,9 @@ def start_ctx_metadata_server(args):
                                             })
                                     except Exception:
                                         pass
-                                if _rg_detector is not None and _rg_state["buffering"] and not _rg_state["hit"]:
-                                    _rg_state["lines"].append(line)
-                                    _rg_state["bytes"] += len(line)
-                                    if (
-                                        _rg_state.get("flush_now")
-                                        or (_rg_detector is not None and len(getattr(_rg_detector, "raw", "")) >= int(_rg_cfg.get("buffer_chars") or 6000))
-                                    ):
-                                        for _rg_l in _rg_state["lines"]:
-                                            self.wfile.write(_rg_l + b"\n")
-                                        _rg_state["lines"] = []
-                                        _rg_state["buffering"] = False
-                                else:
-                                    self.wfile.write(line + b"\n")
+                                _emit_line(line)
                             else:
-                                self.wfile.write(b"\n")
+                                _emit_line(b"")
                             self.wfile.flush()
                         if line and line.startswith(b"data: "):
                             mark_model_activity(model_name, "openai_chat", "stream_chunk", log=False)
@@ -19462,6 +19607,15 @@ def start_ctx_metadata_server(args):
                         return
                 except (BrokenPipeError, ConnectionResetError, requests.RequestException) as exc:
                     log_api_event("openai_chat_stream_interrupted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "error": str(exc), "router_state": replica_trace_state_for_base(model_name)})
+                    try:
+                        if _stream_dump:
+                            _dump_path = f"/tmp/llm-server-stream-dump-{request_id}.log"
+                            with open(_dump_path, "wb") as _dump_fh:
+                                for _dump_chunk in _stream_dump:
+                                    _dump_fh.write(_dump_chunk if _dump_chunk.endswith(b"\n") else _dump_chunk + b"\n")
+                            log_api_event("openai_chat_stream_dump", {"request_id": request_id, "path": _dump_path, "bytes": _stream_dump_bytes})
+                    except Exception:
+                        pass
                 finally:
                     stop_heartbeat.set()
                     heartbeat_thread.join(timeout=1.0)
@@ -19488,6 +19642,7 @@ def start_ctx_metadata_server(args):
                     except Exception:
                         pass
                     _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, content="".join(stream_visible_content_parts), reasoning_len=stream_reasoning_len, tool_calls=[{}] * stream_tool_call_chunks if stream_tool_call_chunks > 0 else [], tool_call_chunks=stream_tool_call_chunks, finish_reason=stream_finish_reason, repair_rounds=stream_repair_round_used)
+                    _check_response_quality(request_id=request_id, model_name=model_name, upstream_model_name=upstream_model_name, messages=upstream_payload.get("messages"), content="".join(stream_visible_content_parts), reasoning="".join(stream_reasoning_parts), finish_reason=stream_finish_reason, tool_calls=stream_tool_call_chunks, chunk_sizes=[len(_p) for _p in stream_visible_content_parts], params={"temperature": upstream_payload.get("temperature"), "max_tokens": upstream_payload.get("max_tokens"), "tools_count": len(upstream_payload.get("tools") or [])}, elapsed_ms=_elapsed_ms(started_at), stream=True)
                     if stream_tool_call_chunks == 0:
                         _capture_tool_intent_failure(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, payload=upstream_payload, response={"content": "".join(stream_visible_content_parts), "reasoning_len": stream_reasoning_len, "tool_call_chunks": stream_tool_call_chunks, "finish_reason": stream_finish_reason, "repair_rounds": stream_repair_round_used})
                         _log_chat_stop_without_tools(request_id, model_name, upstream_model_name, stream=True, content="".join(stream_visible_content_parts), reasoning_len=stream_reasoning_len, finish_reason=stream_finish_reason, repair_rounds=stream_repair_round_used)
@@ -19605,6 +19760,7 @@ def start_ctx_metadata_server(args):
             except Exception:
                 pass
             _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=False, content=nonstream_content, reasoning=nonstream_reasoning, tool_calls=nonstream_tool_calls, tool_call_chunks=len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), finish_reason=choice.get("finish_reason") or "", repair_rounds=repair_rounds_used)
+            _check_response_quality(request_id=request_id, model_name=model_name, upstream_model_name=upstream_model_name, messages=upstream_payload.get("messages"), content=nonstream_content, reasoning=nonstream_reasoning, finish_reason=choice.get("finish_reason") or "", tool_calls=len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), chunk_sizes=None, params={"temperature": upstream_payload.get("temperature"), "max_tokens": upstream_payload.get("max_tokens"), "tools_count": len(upstream_payload.get("tools") or [])}, elapsed_ms=_elapsed_ms(started_at), stream=False)
             if not nonstream_tool_calls:
                 _capture_tool_intent_failure(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=False, payload=upstream_payload, response={"content": nonstream_content, "reasoning": nonstream_reasoning, "finish_reason": choice.get("finish_reason") or "", "repair_rounds": repair_rounds_used})
                 _log_chat_stop_without_tools(request_id, model_name, upstream_model_name, stream=False, content=nonstream_content, reasoning_len=len(nonstream_reasoning), finish_reason=choice.get("finish_reason") or "", repair_rounds=repair_rounds_used)
@@ -19707,6 +19863,10 @@ def start_ctx_metadata_server(args):
             started_at = time.monotonic()
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
+            _maint_target = _maintenance_target_model(catalog)
+            if _maint_target:
+                model_name = _maint_target
+                payload["model"] = model_name
             if not model_name:
                 self._send_json({"error": {"message": "model is required", "type": "invalid_request_error"}}, status=400)
                 return
@@ -21212,6 +21372,10 @@ def start_ctx_metadata_server(args):
                 log_api_event("dedup_bypass_disabled", {"reason": _dedup_bypass_og, "path": self.path.split("?", 1)[0]})
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
+            _maint_target = _maintenance_target_model(catalog)
+            if _maint_target:
+                model_name = _maint_target
+                payload["model"] = model_name
             if not model_name:
                 self._send_json({"error": "model is required"}, status=400)
                 return
@@ -24967,8 +25131,8 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     parser.add_argument("--flatten", action=argparse.BooleanOptionalAction, default=None, help="Flatten Responses-native tools (namespaces) to standard function tools.")
     public_command_metavar = (
         "{add,run,remove,rm,unload,update,config-migrate,config-keys,"
-        "vllm-draft-vocab,refresh-templates,remove-templates,validate,daemon,"
-        "debug,auto-performance,list,ps,requests,logs,hacks,info}"
+        "vllm-draft-vocab,maintenance,refresh-templates,remove-templates,validate,"
+        "daemon,debug,auto-performance,list,ps,requests,logs,hacks,info}"
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar=public_command_metavar)
     subparsers: dict[str, argparse.ArgumentParser] = {}
@@ -25130,6 +25294,22 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     subparsers["config-keys"] = p_config_keys
     p_config_keys.set_defaults(func=print_config_keys)
     p_config_keys.add_argument("--format", choices=("text", "json"), default="text")
+
+    p_maint = sub.add_parser(
+        "maintenance",
+        help="Toggle maintenance mode (local-only, or redirect all requests to one model)",
+        description=(
+            "maintenance on [--model ID] keeps the gateway serving: without --model it "
+            "accepts only localhost; with --model it rewrites every request to that model "
+            "so clients keep working while the stack is being worked on. "
+            "maintenance off clears both files."
+        ),
+    )
+    subparsers["maintenance"] = p_maint
+    p_maint.set_defaults(func=maintenance_command)
+    p_maint.add_argument("action", nargs="?", default="status",
+                         choices=("on", "off", "status", "enable", "disable"))
+    p_maint.add_argument("--model", default=None, help="model id every request is redirected to")
 
     p_draft_vocab = sub.add_parser(
         "vllm-draft-vocab",
