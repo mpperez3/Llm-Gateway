@@ -1071,6 +1071,7 @@ def render_llamaswap_config(
     replica_group_members: list[str] = []
     models_info_for_matrix: list[dict] = []
     mmproj_config = cached_mmproj_config()
+    ninfer_specs: dict[str, int] = {}
 
     def _render_cmd(use_model, include_mmproj: bool) -> list[str]:
         engine = str((getattr(use_model, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
@@ -1177,6 +1178,12 @@ def render_llamaswap_config(
         if str(getattr(m, "backend", "")).lower() == "ninfer":
             entry["useModelName"] = _ninfer_upstream_name(m)
         data["models"][m.model_id] = entry
+        try:
+            _replicas_n = int((getattr(m, "server_overrides", {}) or {}).get("replicas") or 0)
+        except Exception:
+            _replicas_n = 0
+        if _replicas_n > 0 and str(getattr(m, "backend", "")).lower() == "ninfer":
+            ninfer_specs[m.model_id] = _replicas_n
         if public_base_model_id is not None:
             data["models"][m.model_id]["metadata"] = {"internal_replica_of": public_base_model_id}
         if public_base_model_id is None and m.aliases:

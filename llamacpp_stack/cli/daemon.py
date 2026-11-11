@@ -586,6 +586,11 @@ def _replica_reap_plan(args, *, now: float | None = None) -> list[tuple[str, str
         # matrix read, no log lines.
         if int(cfg.max_idle_s) <= 0:
             continue
+        # NInfer replicas are one container per GPU and their last_used is not
+        # updated by request_started (container routes), so the idle test would
+        # unload them at the first tick and every rotation paid a 90 s reload.
+        if str(getattr(model, "backend", "") or "").lower() == "ninfer":
+            continue
         try:
             with state.lock:
                 idle_replica_ids = sorted(

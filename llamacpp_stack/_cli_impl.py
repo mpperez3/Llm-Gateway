@@ -1297,12 +1297,15 @@ def _target_capacity(target_id: str, config_path: Path | str | None = None) -> i
         ).get(str(target_id), "")
     except Exception:
         cmd = ""
-    match = re.search(r"--parallel\s+(\d+)", cmd or "")
-    if match:
-        try:
-            return max(1, int(match.group(1)))
-        except (TypeError, ValueError):
-            pass
+    # llama-server declares slots with --parallel; vLLM with --max-num-seqs and
+    # the NInfer wrapper with --max-concurrency.
+    for flag in ("--parallel", "--max-num-seqs", "--max-concurrency"):
+        match = re.search(rf"{flag}\s+(\d+)", cmd or "")
+        if match:
+            try:
+                return max(1, int(match.group(1)))
+            except (TypeError, ValueError):
+                pass
     return 1
 
 
@@ -6093,6 +6096,27 @@ class ReplicaRouterState:
                 # cold (pid is None), so "record exists" must never be reported as
                 # READY: the reaper then "retired" every cold replica every tick
                 # and the affinity policy treated unloaded targets as serving.
+                if port > 0 and _probe_target_health is not None:
+                    # Routes supervised outside this process (llama-swap starts a
+                    # container; there is no llama-server pid) are still measurable
+                    # through their port. Without this probe an externally started
+                    # replica stays COLD forever and is never spread to.
+                    probed = _probe_target_health(
+                        target,
+                        pid=0,
+                        port=port,
+                        state=_target_state_from_record_status(rec.status),
+                        in_flight=in_flight,
+                        capacity=_target_capacity(target),
+                        blacklist_until=float(rec.blacklist_until or 0.0),
+                        probe=probe,
+                        timeout_s=cfg.probe_timeout_s,
+                    )
+                    with self.lock:
+                        if probed.state is _TargetState.READY:
+                            rec.status = "ready"
+                            self._health_cache[target] = (now + cfg.probe_interval_s, probed)
+                    return probed
                 state = _target_state_from_record_status(rec.status)
                 return _TargetHealth(
                     target=target,
@@ -6411,6 +6435,24 @@ def reject_if_model_loading_request(
     """
     if not upstream_model_name:
         return False
+    # A route that is already serving (container started by llama-swap, no
+    # llama-server pid) must not take a load claim: the claim is held for 900 s
+    # and turns every concurrent request into a 503. Probe its port first.
+    try:
+        _port = get_config_model_port_map(Path(DEFAULT_CONFIG_PATH)).get(str(upstream_model_name))
+        if _port and _probe_target_health is not None:
+            _probe = _probe_target_health(
+                str(upstream_model_name),
+                pid=0,
+                port=int(_port),
+                state=_TargetState.READY,
+                capacity=_target_capacity(str(upstream_model_name)),
+                timeout_s=1.0,
+            )
+            if _probe.state is _TargetState.READY:
+                return False
+    except Exception:
+        pass
     if REPLICA_ROUTER_STATE.claim_loading(upstream_model_name, catalog, is_replica=is_replica):
         return False
     message = (
@@ -7270,6 +7312,19 @@ def select_replica_for_request(
         return base_model.model_id, "", False
     now = time.monotonic()
     REPLICA_ROUTER_STATE.prune(now)
+
+    def _base_return() -> tuple[str, str, bool]:
+        # Stamp the base at *selection* time. request_started() fires only when
+        # the upstream request leaves, which for a cold load is minutes later;
+        # without this stamp a second request arriving during the load still saw
+        # the base as unused and stacked on it instead of spreading.
+        try:
+            with REPLICA_ROUTER_STATE.lock:
+                REPLICA_ROUTER_STATE.base_last_used[base_model.model_id] = time.monotonic()
+        except Exception:
+            pass
+        return _base_return()
+
     previous_response_id = str(payload.get("previous_response_id") or "").strip()
     mapped_response_replica = REPLICA_ROUTER_STATE.response_replica(previous_response_id) if previous_response_id else None
     affinity_key = resolve_request_affinity_key(base_model.model_id, payload, headers)
@@ -7281,10 +7336,98 @@ def select_replica_for_request(
     if not gpu_sets:
         _size_mib = _get_model_size_mib(base_model)
         log_api_event("replica_no_gpu_sets", {"model": base_model.model_id, "replicas_max": cfg.max, "gpus_per_replica": cfg.gpus_per_replica, "size_mib": int(_size_mib), "two_copies_mib": int(2 * _size_mib + cfg.safety_vram_mib), "gpu_capacity_mib": int(cfg.gpu_capacity_mib), "safety_vram_mib": int(cfg.safety_vram_mib)})
-        return base_model.model_id, affinity_key, False
+        return _base_return()
     replica_ids = [replica_model_id(base_model.model_id, idx) for idx in range(len(gpu_sets))]
     published = set(published_model_ids) if published_model_ids is not None else get_published_model_ids()
     published_replica_ids = [rid for rid in replica_ids if rid in published]
+    # NInfer replicas are statically one per GPU. New conversations balance
+    # across them; an existing conversation keeps its owner while that owner has
+    # a free slot, and spills to the other replica once it is full (2 lanes).
+    if (
+        str(getattr(base_model, "backend", "") or "").lower() == "ninfer"
+        and published_replica_ids
+        and not previous_response_id
+    ):
+        members = [base_model.model_id, *published_replica_ids]
+        now_sel = time.monotonic()
+        with REPLICA_ROUTER_STATE.lock:
+            _recent = _NINFER_RECENT
+            for _mid in members:
+                _recent[_mid] = [t for t in _recent.get(_mid, []) if now_sel - t <= 15.0]
+        # Fallback keys are a client-level bucket, not a conversation: keeping
+        # them sticky sends every request to the first replica while the other
+        # card idles. Only explicit conversation keys stay sticky.
+        _fallback_key = ":fallback:" in str(affinity_key)
+        owner_now = None if _fallback_key else REPLICA_ROUTER_STATE.owner_of(affinity_key, now)
+        if owner_now is not None and owner_now in members:
+            try:
+                _owner_cap = max(1, _target_capacity(owner_now))
+            except Exception:
+                _owner_cap = 1
+            try:
+                _idle_threshold = float(_resolve_affinity_spillover_config().get("idle_threshold_s", 30))
+            except Exception:
+                _idle_threshold = 30.0
+            # The router's last_used is only updated by request_started/finished,
+            # which do not fire for every container route. Keep our own stamp.
+            _last = float(_NINFER_LAST.get(owner_now, 0.0) or 0.0)
+            _idle = (now_sel - _last) if _last > 0 else 0.0
+            if len(_recent.get(owner_now, [])) < _owner_cap and _idle < _idle_threshold:
+                _NINFER_LAST[owner_now] = now_sel
+                _recent.setdefault(owner_now, []).append(now_sel)
+                try:
+                    _orec = REPLICA_ROUTER_STATE.records.get(owner_now)
+                    if _orec is not None:
+                        _orec.last_used = now_sel
+                    else:
+                        REPLICA_ROUTER_STATE.base_last_used[owner_now] = now_sel
+                except Exception:
+                    pass
+                return owner_now, affinity_key, owner_now in replica_ids
+            # The owner is full, or has been idle long enough that the other
+            # replica should be warmed with this context: rotate.
+            _others = [m for m in members if m != owner_now] or members
+            with REPLICA_ROUTER_STATE.lock:
+                _recent = _NINFER_RECENT
+                for _mid in _others:
+                    _recent[_mid] = [t for t in _recent.get(_mid, []) if now_sel - t <= 15.0]
+                target = min(_others, key=lambda m: len(_recent.get(m, [])))
+                _recent.setdefault(target, []).append(now_sel)
+                _NINFER_LAST[target] = now_sel
+                try:
+                    _trec = REPLICA_ROUTER_STATE.records.get(target)
+                    if _trec is not None:
+                        _trec.last_used = now_sel
+                    else:
+                        REPLICA_ROUTER_STATE.base_last_used[target] = now_sel
+                except Exception:
+                    pass
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, target, _TransferReason.STICKY_REFRESH, ttl_s=cfg.sticky_ttl_s, now=now
+            )
+            log_api_event("replica_rotate_idle", {
+                "model": base_model.model_id, "from": owner_now, "to": target,
+                "idle_s": round(_idle, 1), "threshold_s": _idle_threshold,
+            })
+            return target, affinity_key, target in replica_ids
+        with REPLICA_ROUTER_STATE.lock:
+            _recent = _NINFER_RECENT
+            for _mid in members:
+                _recent[_mid] = [t for t in _recent.get(_mid, []) if now_sel - t <= 15.0]
+            loads = [len(_recent.get(_mid, [])) for _mid in members]
+            start = int(_NINFER_RR.get(base_model.model_id, 0))
+            idx = min(
+                range(len(members)),
+                key=lambda i: (loads[i], (i - start) % len(members)),
+            )
+            _NINFER_RR[base_model.model_id] = start + 1
+            _recent.setdefault(members[idx], []).append(now_sel)
+        target = members[idx]
+        REPLICA_ROUTER_STATE.bind(
+            affinity_key, target, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+        )
+        log_api_event("replica_round_robin", {"model": base_model.model_id, "target": target, "idx": idx})
+        return target, affinity_key, target in replica_ids
     dynamic_routes_enabled = catalog is not None and config_path is not None and server_path is not None
     if not published_replica_ids and not dynamic_routes_enabled:
         with REPLICA_ROUTER_STATE.lock:
@@ -7300,7 +7443,7 @@ def select_replica_for_request(
                     "published_sample": sorted(list(published))[:20],
                 },
             )
-        return base_model.model_id, affinity_key, False
+        return _base_return()
     # Resolved once, here, because it reads the rendered matrix file and must stay
     # outside the router lock (health_of probes and _placement_fits shells out to
     # nvidia-smi below). Only consulted for requests with no live affinity: a
@@ -7402,7 +7545,7 @@ def select_replica_for_request(
             )
             if result.target:
                 return result.target, affinity_key, result.target in replica_ids
-            return base_model.model_id, affinity_key, False
+            return _base_return()
         result = REPLICA_ROUTER_STATE.bind(
             affinity_key,
             base_model.model_id if owner in replica_ids else owner,
@@ -7412,7 +7555,7 @@ def select_replica_for_request(
         )
         if result.target:
             return result.target, affinity_key, result.target in replica_ids
-        return base_model.model_id, affinity_key, False
+        return _base_return()
     with REPLICA_ROUTER_STATE.lock:
         candidates = [
             REPLICA_ROUTER_STATE.records[rid]
@@ -7427,6 +7570,10 @@ def select_replica_for_request(
         ready_idle = [r for r in candidates if r.status == "ready" and r.in_flight == 0]
         base_load = int(REPLICA_ROUTER_STATE.base_in_flight.get(base_model.model_id, 0))
         base_last = float(REPLICA_ROUTER_STATE.base_last_used.get(base_model.model_id, 0.0) or 0.0)
+        # Cold-spread window: a new request that arrives while the base was used
+        # moments ago belongs on a replica even if the base's in-flight counter
+        # has not been incremented yet (model load, stream setup).
+        recently_used = base_last > 0.0 and (now - base_last) <= 120.0
         # A second instance for a request with nowhere to be is pure cost: it
         # steals VRAM from whatever else is loading, and during a conflicting load
         # it would evict that load. Gating only the spread -- not the whole branch
@@ -7442,17 +7589,18 @@ def select_replica_for_request(
                 )
                 log_api_event("replica_spread_new_conversation", {"model": base_model.model_id, "replica": best.replica_model_id, "affinity_key": affinity_key, "base_last_used_ago_s": now - base_last})
                 return best.replica_model_id, affinity_key, True
-            REPLICA_ROUTER_STATE.bind(
-                affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
-            )
-            log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
-            return base_model.model_id, affinity_key, False
+            if not recently_used:
+                REPLICA_ROUTER_STATE.bind(
+                    affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+                )
+                log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
+                return _base_return()
         if base_load <= 0 and not dynamic_routes_enabled:
             REPLICA_ROUTER_STATE.bind(
                 affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
             )
             log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
-            return base_model.model_id, affinity_key, False
+            return _base_return()
         # For a new conversation/agent with no sticky binding, reuse an idle
         # ready replica when there is one; cold scale-out is handled below.
         used_by_records: dict[int, int] = {}
@@ -7460,7 +7608,10 @@ def select_replica_for_request(
             if rec.status in {"ready", "loading"}:
                 for gpu in rec.gpu_set:
                     used_by_records[gpu] = used_by_records.get(gpu, 0) + 1
-        cold = [r for r in candidates if r.status in {"cold", "error"}]
+        cold = [
+            r for r in candidates
+            if r.status in {"cold", "error"} and r.replica_model_id in published_replica_ids
+        ]
         # A cold replica load is only justified by real concurrency: the base is
         # already serving another request. When the base is idle, this request
         # belongs on the base -- resident or not -- instead of duplicating the
@@ -7470,7 +7621,7 @@ def select_replica_for_request(
         # replica and the next request paid it again.
         defer_scale_out = (
             load_blocker is not None
-            or base_load <= 0
+            or (base_load <= 0 and not recently_used)
             or cfg.prefer_base_over_replica
         )
     if defer_scale_out:
@@ -7542,13 +7693,13 @@ def select_replica_for_request(
             return chosen.replica_model_id, affinity_key, True
         if not candidates:
             log_api_event("replica_no_unblacklisted_routes", {"model": base_model.model_id, "replicas": replica_ids})
-            return base_model.model_id, affinity_key, False
+            return _base_return()
         if int(REPLICA_ROUTER_STATE.base_in_flight.get(base_model.model_id, 0)) <= 0:
             REPLICA_ROUTER_STATE.bind(
                 affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
             )
             log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
-            return base_model.model_id, affinity_key, False
+            return _base_return()
         live = [r for r in candidates if r.status in {"ready", "loading"}]
         if not live:
             # Cold scale-out was declined (blocker, prefer-base, or no placement
@@ -7558,7 +7709,7 @@ def select_replica_for_request(
                 affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
             )
             log_api_event("replica_base_only_target", {"model": base_model.model_id, "affinity_key": affinity_key})
-            return base_model.model_id, affinity_key, False
+            return _base_return()
         chosen = sorted(live, key=lambda r: (r.in_flight, 1 if r.status == "loading" else 0, r.last_used))[0]
         REPLICA_ROUTER_STATE.bind(
             affinity_key, chosen.replica_model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
@@ -17208,6 +17359,10 @@ def _is_loopback_client(host: str) -> bool:
         return False
 
 
+_NINFER_RR: dict[str, int] = {}
+_NINFER_RECENT: dict[str, list[float]] = {}
+_NINFER_LAST: dict[str, float] = {}
+
 MAINTENANCE_FLAG_PATH = DEFAULT_REQUESTS_LOG_PATH.with_name("maintenance")
 MAINTENANCE_TARGET_PATH = MAINTENANCE_FLAG_PATH.with_name("maintenance-target")
 
@@ -18168,12 +18323,10 @@ def start_ctx_metadata_server(args):
                 if current_total >= limit:
                     overloaded_total = current_total
                 else:
-                    if target in REPLICA_ROUTER_STATE.records:
-                        REPLICA_ROUTER_STATE.records[target].in_flight += 1
-                        REPLICA_ROUTER_STATE.records[target].last_used = time.monotonic()
-                    else:
-                        REPLICA_ROUTER_STATE.base_in_flight[target] = current_total + 1
-                        REPLICA_ROUTER_STATE.base_last_used[target] = time.monotonic()
+                    # The counter is owned by request_started/request_finished.
+                    # Incrementing here too leaked one slot per request (the two
+                    # paths never paired), so after two requests every call saw
+                    # the target full and answered 429.
                     return False, None
             message = (
                 f"Model '{target}' is overloaded: {overloaded_total} concurrent requests (limit {limit}). "
