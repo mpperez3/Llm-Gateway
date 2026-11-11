@@ -7358,58 +7358,6 @@ def select_replica_for_request(
         # them sticky sends every request to the first replica while the other
         # card idles. Only explicit conversation keys stay sticky.
         _fallback_key = ":fallback:" in str(affinity_key)
-        owner_now = None if _fallback_key else REPLICA_ROUTER_STATE.owner_of(affinity_key, now)
-        if owner_now is not None and owner_now in members:
-            try:
-                _owner_cap = max(1, _target_capacity(owner_now))
-            except Exception:
-                _owner_cap = 1
-            try:
-                _idle_threshold = float(_resolve_affinity_spillover_config().get("idle_threshold_s", 30))
-            except Exception:
-                _idle_threshold = 30.0
-            # The router's last_used is only updated by request_started/finished,
-            # which do not fire for every container route. Keep our own stamp.
-            _last = float(_NINFER_LAST.get(owner_now, 0.0) or 0.0)
-            _idle = (now_sel - _last) if _last > 0 else 0.0
-            if len(_recent.get(owner_now, [])) < _owner_cap and _idle < _idle_threshold:
-                _NINFER_LAST[owner_now] = now_sel
-                _recent.setdefault(owner_now, []).append(now_sel)
-                try:
-                    _orec = REPLICA_ROUTER_STATE.records.get(owner_now)
-                    if _orec is not None:
-                        _orec.last_used = now_sel
-                    else:
-                        REPLICA_ROUTER_STATE.base_last_used[owner_now] = now_sel
-                except Exception:
-                    pass
-                return owner_now, affinity_key, owner_now in replica_ids
-            # The owner is full, or has been idle long enough that the other
-            # replica should be warmed with this context: rotate.
-            _others = [m for m in members if m != owner_now] or members
-            with REPLICA_ROUTER_STATE.lock:
-                _recent = _NINFER_RECENT
-                for _mid in _others:
-                    _recent[_mid] = [t for t in _recent.get(_mid, []) if now_sel - t <= 15.0]
-                target = min(_others, key=lambda m: len(_recent.get(m, [])))
-                _recent.setdefault(target, []).append(now_sel)
-                _NINFER_LAST[target] = now_sel
-                try:
-                    _trec = REPLICA_ROUTER_STATE.records.get(target)
-                    if _trec is not None:
-                        _trec.last_used = now_sel
-                    else:
-                        REPLICA_ROUTER_STATE.base_last_used[target] = now_sel
-                except Exception:
-                    pass
-            REPLICA_ROUTER_STATE.bind(
-                affinity_key, target, _TransferReason.STICKY_REFRESH, ttl_s=cfg.sticky_ttl_s, now=now
-            )
-            log_api_event("replica_rotate_idle", {
-                "model": base_model.model_id, "from": owner_now, "to": target,
-                "idle_s": round(_idle, 1), "threshold_s": _idle_threshold,
-            })
-            return target, affinity_key, target in replica_ids
         with REPLICA_ROUTER_STATE.lock:
             _recent = _NINFER_RECENT
             for _mid in members:
