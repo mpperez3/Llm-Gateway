@@ -7750,7 +7750,8 @@ models:
             "1234 python -m vllm.entrypoints.openai.api_server "
             "--model /models/qwen --port 18087 --served-model-name qwen"
         )
-        with mock.patch(
+        with mock.patch("llamacpp_stack._cli_impl._LLAMA_PROC_CACHE", (-1.0, [])), \
+             mock.patch(
             "llamacpp_stack.cli.subprocess.run",
             return_value=Namespace(stdout=vllm_cmd),
         ):

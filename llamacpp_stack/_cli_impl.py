@@ -7368,7 +7368,7 @@ def select_replica_for_request(
                 REPLICA_ROUTER_STATE.base_last_used[base_model.model_id] = time.monotonic()
         except Exception:
             pass
-        return _base_return()
+        return base_model.model_id, affinity_key, False
 
     previous_response_id = str(payload.get("previous_response_id") or "").strip()
     mapped_response_replica = REPLICA_ROUTER_STATE.response_replica(previous_response_id) if previous_response_id else None
@@ -7385,11 +7385,16 @@ def select_replica_for_request(
     replica_ids = [replica_model_id(base_model.model_id, idx) for idx in range(len(gpu_sets))]
     published = set(published_model_ids) if published_model_ids is not None else get_published_model_ids()
     published_replica_ids = [rid for rid in replica_ids if rid in published]
-    # Engines with static published replica routes (NInfer today; any backend
-    # that publishes <model>__replica_N as a real route) share one policy: new
-    # conversations spread, an existing conversation keeps its owner while it
-    # has a free slot, and the overflow spills to the other route when full.
-    if published_replica_ids and not previous_response_id:
+    # NInfer replicas are statically one per GPU. New conversations balance
+    # across them; an existing conversation keeps its owner while that owner has
+    # a free slot, and spills to the other replica once it is full (2 lanes).
+    # Only NInfer publishes real <model>__replica_N routes today; other engines
+    # use the dynamic placement path below.
+    if (
+        str(getattr(base_model, "backend", "") or "").lower() == "ninfer"
+        and published_replica_ids
+        and not previous_response_id
+    ):
         members = [base_model.model_id, *published_replica_ids]
         now_sel = time.monotonic()
         with REPLICA_ROUTER_STATE.lock:
@@ -7444,6 +7449,12 @@ def select_replica_for_request(
             # No migration between routes: the old per-turn preload ping-ponged
             # one conversation between cards, re-prefilling the full prompt each
             # time. Affinity stays put; only the burst overflow above leaves it.
+            # Refresh the binding TTL so a long conversation does not lose its
+            # target once the original sticky window elapses.
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, owner_now, _TransferReason.STICKY_REFRESH,
+                ttl_s=cfg.sticky_ttl_s, now=now,
+            )
             _STATIC_ROUTE_LAST[owner_now] = now_sel
             with REPLICA_ROUTER_STATE.lock:
                 _STATIC_ROUTE_RECENT.setdefault(owner_now, []).append(now_sel)
@@ -7656,7 +7667,9 @@ def select_replica_for_request(
                     used_by_records[gpu] = used_by_records.get(gpu, 0) + 1
         cold = [
             r for r in candidates
-            if r.status in {"cold", "error"} and r.replica_model_id in published_replica_ids
+            if r.status in {"cold", "error"} and (
+                r.replica_model_id in published_replica_ids or dynamic_routes_enabled
+            )
         ]
         # A cold replica load is only justified by real concurrency: the base is
         # already serving another request. When the base is idle, this request
@@ -7730,13 +7743,19 @@ def select_replica_for_request(
             if REPLICA_ROUTER_STATE.records[rid].blacklist_until <= now
         ]
         ready_empty = [r for r in candidates if r.status == "ready" and r.in_flight == 0]
-        if ready_empty:
+        if ready_empty and load_blocker is None and not cfg.prefer_base_over_replica:
             chosen = sorted(ready_empty, key=lambda r: r.last_used)[0]
             REPLICA_ROUTER_STATE.bind(
                 affinity_key, chosen.replica_model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
             )
             log_api_event("replica_selected_ready_empty", {"model": base_model.model_id, "replica": chosen.replica_model_id})
             return chosen.replica_model_id, affinity_key, True
+        if (load_blocker is not None or cfg.prefer_base_over_replica) and ready_empty:
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+            )
+            log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
+            return _base_return()
         if not candidates:
             log_api_event("replica_no_unblacklisted_routes", {"model": base_model.model_id, "replicas": replica_ids})
             return _base_return()

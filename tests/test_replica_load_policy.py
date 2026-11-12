@@ -825,7 +825,7 @@ class RouterHealthTruthfulnessTest(unittest.TestCase, _RouterStateMixin):
         self.reset_router_state()
         self.state = _cli_impl.REPLICA_ROUTER_STATE
 
-    def _record(self, status: str, *, pid=None, port=18113):
+    def _record(self, status: str, *, pid=None, port=0):
         self.state.records[REPLICA_ID] = ReplicaRecord(
             base_model_id=BASE_ID,
             replica_model_id=REPLICA_ID,
