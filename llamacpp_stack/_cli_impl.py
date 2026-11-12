@@ -4544,7 +4544,7 @@ def resolve_request_reasoning_budget(
     limit, so the policy is clamped to leave output room and to the active
     predict/request cap. Explicit client controls always win.
     """
-    if not isinstance(payload, dict) or _model_backend(model) != "llama.cpp":
+    if not isinstance(payload, dict) or _model_backend(model) not in {"llama.cpp", "ninfer"}:
         return None, "unsupported_backend"
     # Numeric budgets are real client decisions; qualitative hints carry no
     # token budget and must never disable this starvation safety net.
@@ -19400,6 +19400,13 @@ def start_ctx_metadata_server(args):
                     # the reasoning end tokens natively (works with spec-decode).
                     _rb_field = "thinking_token_budget"
                     _rb_defaults = resolve_vllm_defaults(args)
+                elif _rb_backend == "ninfer":
+                    # ninfer reads `thinking_budget_tokens` per request and also
+                    # honors `reasoning_control` (the bundled UI sets both). The
+                    # half_context policy lives in llama_server_defaults, which is
+                    # backend-agnostic here.
+                    _rb_field = "thinking_budget_tokens"
+                    _rb_defaults = resolve_llama_server_defaults(args)
                 if _rb_field is not None and _rb_defaults is not None:
                     reasoning_budget, reasoning_budget_reason = resolve_request_reasoning_budget(
                         payload,
@@ -19408,6 +19415,8 @@ def start_ctx_metadata_server(args):
                     )
                     if reasoning_budget is not None:
                         upstream_payload[_rb_field] = reasoning_budget
+                        if _rb_backend == "ninfer":
+                            upstream_payload["reasoning_control"] = True
                         log_api_event(
                             "openai_reasoning_budget_applied",
                             {
