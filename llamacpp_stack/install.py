@@ -4419,6 +4419,9 @@ def render_manager_wrapper(layout: InstallLayout) -> str:
                     exit 1
                 fi
         export PYTHONPATH="$LLM_SERVER_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
+        # El comando de vLLM se lanza por nombre (vllm-server); sin este PATH
+        # llama-swap no lo resuelve bajo systemd y devuelve 500 al arrancar.
+        export PATH="{layout.bin_dir}:${{PATH:-/usr/local/bin:/usr/bin:/bin}}"
                 if [[ -n "${{LLAMA_SERVER_BIN:-}}" ]] && [[ -e "$LLAMA_SERVER_BIN" || -L "$LLAMA_SERVER_BIN" ]]; then
                     LLAMA_SERVER_REAL="$(readlink -f "$LLAMA_SERVER_BIN" || printf '%s' "$LLAMA_SERVER_BIN")"
                     if [[ -n "$LLAMA_SERVER_REAL" ]]; then
@@ -4465,6 +4468,9 @@ def render_llamaswap_wrapper(layout: InstallLayout) -> str:
         : "${{LLM_SERVER_PUBLIC_HOST:=${{HEIMDALL_GATEWAY_PUBLIC_HOST:-}}}}"
         : "${{LLM_SERVER_PUBLIC_PORT:=${{HEIMDALL_GATEWAY_PUBLIC_PORT:-}}}}"
         export PYTHONPATH="$LLM_SERVER_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
+        # El comando de vLLM se lanza por nombre (vllm-server); sin este PATH
+        # llama-swap no lo resuelve bajo systemd y devuelve 500 al arrancar.
+        export PATH="{layout.bin_dir}:${{PATH:-/usr/local/bin:/usr/bin:/bin}}"
         if [[ -n "${{LLAMA_SERVER_BIN:-}}" ]] && [[ -e "$LLAMA_SERVER_BIN" || -L "$LLAMA_SERVER_BIN" ]]; then
           LLAMA_SERVER_REAL="$(readlink -f "$LLAMA_SERVER_BIN" || printf '%s' "$LLAMA_SERVER_BIN")"
           if [[ -n "$LLAMA_SERVER_REAL" ]]; then
@@ -4546,6 +4552,9 @@ def render_cli_wrapper(layout: InstallLayout) -> str:
         : "${{LLM_SERVER_CUDA_ROOT:=${{HEIMDALL_GATEWAY_CUDA_ROOT:-}}}}"
         : "${{LLM_SERVER_NCCL_ROOT:=${{HEIMDALL_GATEWAY_NCCL_ROOT:-}}}}"
         export PYTHONPATH="$LLM_SERVER_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
+        # El comando de vLLM se lanza por nombre (vllm-server); sin este PATH
+        # llama-swap no lo resuelve bajo systemd y devuelve 500 al arrancar.
+        export PATH="{layout.bin_dir}:${{PATH:-/usr/local/bin:/usr/bin:/bin}}"
         if [[ -n "${{LLM_SERVER_CUDA_ROOT:-}}" ]]; then
           export CUDA_PATH="$LLM_SERVER_CUDA_ROOT"
           export LD_LIBRARY_PATH="$LLM_SERVER_CUDA_ROOT/lib64:$LLM_SERVER_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"

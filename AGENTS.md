@@ -1,324 +1,210 @@
 # AGENTS.md — LLM Server (llamacpp-stack)
 
-> Guía para agentes de codificación (LLMs) que trabajan en este repositorio. Lee este archivo antes de explorar, instalar, testear o modificar código.
+> Guía para agentes de codificación. **Este fichero se inyecta en cada sesión.** Es un router:
+> el detalle vive en `.opencode/memory/`, `.opencode/skills/` y `docs/`.
+
+## 0. Protocolo obligatorio (antes de actuar)
+
+1. Lee **`.opencode/memory/invariants.md`** y **`.opencode/memory/preferences.md`**. No son
+   opcionales: son restricciones declaradas por el usuario. Si el código contradice una regla,
+   gana el código y debes reportar la contradicción.
+2. Si vas a **depurar**, lee también `known-issues.md` (los síntomas ya vistos están ahí).
+3. Si el trabajo toca **placement, réplicas, dedup, reasoning, logs o motores**, lee
+   `decisions.md`.
+4. Si existe una skill para el workflow (§6), **lee su `SKILL.md` completo antes de ejecutar**.
+4b. Si el trabajo usa vocabulario de motores, rutas o réplicas, consulta
+   `.opencode/memory/glossary.md`. **Cuatro motores distintos: `beellama` ≠ `buun` ≠
+   `exllama` ≠ `vllm`.** Confundirlos produce diagnósticos falsos.
+5. Antes de decir "esto ya se probó / está así desde siempre", consulta `events.md`.
+
+Trabajo trivial (typo, renombrar variable): basta el paso 1.
 
 ## 1. Qué es este repo
 
-**LLM Server** es un gateway de inferencia local, compatible con OpenAI, para ejecutar y rotar LLMs en hardware propio. Orquesta:
+Gateway de inferencia local compatible con OpenAI. Descarga y registra GGUF de Hugging Face,
+genera `config.yaml` para `llama-swap` desde `catalog.json` + `conf.json`, y enruta a
+`llama.cpp`, `buun` (EXL3 nativo) o `vLLM` (beta). Incluye réplicas conversation-affine,
+auto-context, MTP/speculative, placement GPU, logs/diagnóstico y cleanup de huérfanos.
 
-- Descarga y registro de modelos GGUF de Hugging Face (selección de quant, shards).
-- Generación de `config.yaml` para `llama-swap` desde un catálogo (`catalog.json`) + ajustes globales (`conf.json`).
-- Ruteo OpenAI-compatible hacia `llama.cpp` (`llama-server`) o backend `vLLM` (beta).
-- Réplicas conversation-affine, auto-context, MTP/speculative, defaults por familia, placement GPU, logs/diagnóstico y cleanup seguro de huérfanos.
-
-Comando público único: **`llm-server`** (`llamacpp_stack/llamacpp_api_install.py:main` -> `pyproject.toml:15`). No hay alias legacy.
-
-Arquitectura resumida:
+Comando público único: **`llm-server`** (`llamacpp_stack/llamacpp_api_install.py:main`).
+No hay alias legacy público (`heimdall-gateway` es alias deprecado, no lo uses en docs nuevas).
 
 ```
-cliente OpenAI --> LLM Server API :11435 --> llama-swap :11436 --> llama-server (GGUF) / vllm-server (HF)
-                                      --> conf.json + catalog.json --> config.yaml (generado)
+cliente OpenAI → :11435 gateway → :11436 llama-swap (+guard) → llama-server / buun / vllm-server
+                               ↘ conf.json + catalog.json → config.yaml (generado)
 ```
 
-Detalles completos en `README.md` y `docs/LLM_INSTALL.md` (checklist obligatorio para installs asistidos).
+**Dos entry points, misma responsabilidad de política.** `:11435` aplica dedup, budget de
+reasoning, réplicas y tool-repair, y escribe `api-requests.log`. `:11436` es el router
+`llama-swap` (servicio `llm-server-router`); los clientes que entran por ahí (Hermes, web UI)
+**no pasan por el gateway**: un fix solo en `:11435` no les llega.
 
----
+## 2. No negociables (resumen de invariantes)
 
-## 2. Regla de oro: `uv` es el gestor preferente
+1. **Contexto máximo siempre** (263–264K por slot). No lo reduzcas para que quepa.
+2. **No bajar cuantización** de modelo ni de KV cache para encajar en una GPU.
+3. **No dividir contexto**; con `parallel=N`, `ctx_size = N × ctx_por_slot`.
+4. **No desactivar MTP/draft** en comparativas.
+5. **Nunca afirmar rendimiento sin medirlo en esta máquina.** Cero cifras de terceros.
+6. **Comparaciones 1 vs 1**: mismo modelo, quant, prompt y `max_tokens`; una variable por carga.
+7. **`uv` para todo.** Nunca `pip`, nunca `venv` puro.
+8. **Merge, no sobrescritura** en `conf.json`/`catalog.json`; preserva `api_key`, `idle_ttl`,
+   `models-dir`, certs y puertos.
+9. **Arregla la causa, no el síntoma.** Sin parches rápidos ni revertir el plan.
+10. **No escribir `config.yaml` en runtime**: llama-swap v255 descarga todos los modelos.
+11. **Nada hardcodeado por modelo** en Python (ni nombres ni ids).
+12. **Todo parche se documenta con su fuente** para poder reaplicarlo.
 
-> **En este repositorio se usa preferentemente `uv` para todo lo que tiene que ver con instalaciones en este entorno o en instaladores.**
+Lista completa con motivo y fecha: `.opencode/memory/invariants.md`.
 
-Esto aplica a:
+## 3. `uv` es obligatorio
 
-- Crear entornos virtuales.
-- Instalar dependencias del proyecto y de desarrollo.
-- Instalaciones editables (`pip install -e .`).
-- Invocar tests, linters y el CLI en el entorno del repo.
-- Cualquier script o automatización que instale paquetes Python.
+| Acción | Correcto |
+|---|---|
+| Tests | `uv run pytest -q` |
+| CLI | `uv run llm-server info` |
+| Instalar deps | `uv add <pkg>` / `uv sync` |
+| Instalar proyecto editable | `uv pip install -e .` |
+| Script suelto | `uv run python tools/foo.py` |
 
-**No uses `pip`/`pip3`/`python -m pip` ni `venv` puro si `uv` está disponible.** Si `uv` no está instalado, instálalo primero y luego continúa. Los ejemplos de `README.md` que usan `pip` son válidos como fallback documentado, pero para trabajo de agente en este repo debes traducirlos a equivalentes `uv`.
+`uv.lock` manda. Si `uv` no está, instálalo antes de continuar. Los `pip` del `README.md` son
+fallback documentado para humanos, no para el agente.
 
-### Equivalencias rápidas
-
-| Acción | Con `pip` (README) | Con `uv` (preferido aquí) |
-|---|---|---|
-| Crear venv Python 3.12 | `python3.12 -m venv .venv` | `uv venv --python 3.12 .venv` |
-| Activar venv | `source .venv/bin/activate` | `source .venv/bin/activate` (igual) |
-| Instalar proyecto editable | `python -m pip install -e .` | `uv pip install -e .` o `uv sync` |
-| Instalar proyecto no editable | `python -m pip install .` | `uv pip install .` |
-| Sincronizar lockfile | — | `uv sync` (lee `uv.lock` + `pyproject.toml`) |
-| Añadir dependencia | `pip install <pkg>` | `uv add <pkg>` / `uv pip install <pkg>` |
-| Correr tests | `pytest -q` | `uv run pytest -q` |
-| Correr CLI | `llm-server info` | `uv run llm-server info` |
-| Correr script Python | `python tools/foo.py` | `uv run python tools/foo.py` |
-
-> Si necesitas reproducir exactamente un comando del `README.md` o de `docs/LLM_INSTALL.md` para verificar documentación, puedes mostrar ambas variantes, pero ejecuta la variante `uv`.
-
-### Por qué `uv.lock` manda
-
-- El repo fija `requires-python >=3.12` y el lock en `uv.lock` (versión actual con `huggingface-hub==1.10.1`, `pyyaml`, `requests`, `hf-transfer`, etc.).
-- `uv sync` respeta `uv.lock` y es más rápido/determinista que `pip install`.
-- En instaladores/automatización, preferir `uv pip install` mantiene el entorno reproducible.
-
-### Nota para `install.py` / bundle
-
-- `llamacpp_stack/install.py` y `llamacpp_stack/bundle/install_llamacpp_stack.sh` son los instaladores de **usuario final** del gateway (servicios systemd, modelos, certs). Crean su propio bootstrap venv si hace falta.
-- Cuando como agente **desarrollas o testeas** esos instaladores, usa `uv` para preparar el entorno de desarrollo desde el que los invocas (`uv run llm-server install --mode user --backend auto --dry-run`), no para reemplazar la lógica interna del instalador salvo que el cambio solicitado sea precisamente migrar el instalador a `uv`.
-
----
-
-## 3. Requisitos
-
-- **Linux** (única plataforma soportada para gateway).
-- **Python >=3.12** (ver `pyproject.toml:6`).
-- `uv` instalado (preferente). Fallback: `python3.12` + `pip >= 23`.
-- NVIDIA driver/CUDA solo si se usa inferencia GPU; el gateway en sí funciona en CPU.
-- Espacio en disco para modelos (ej. Qwen 32B Q4 ~18 GB).
-- `cmake`, `ninja`, `curl`, `git` si compilas `llama.cpp` en modo `source`.
-
-Verificación rápida del entorno (ejecuta antes de cualquier install):
-
-```bash
-uv --version 2>&1 || echo "uv no instalado"
-uv python list 2>&1 | head -n 20
-python3.12 --version 2>&1; which python3.12
-nvidia-smi 2>&1 | head -n 30 || echo "sin GPU/driver"
-df -h /var /home 2>&1 | head -n 20
-ss -tlnp | grep -E '11434|11435|11436' || echo "puertos libres"
-llm-server info 2>&1 | head -n 80 || echo "gateway no instalado"
-```
-
----
-
-## 4. Mapa del repositorio
+## 4. Mapa mínimo
 
 ```
-.
-├── llamacpp_stack/          # Paquete principal (llm-server)
-│   ├── cli.py               # Shim <400 líneas — solo re-exports desde cli/* (sin lógica duplicada)
-│   ├── cli/                 # Paquete modularizado (env, constants, models, parser, replica, server_commands, gateway, daemon)
-│   │   ├── __init__.py      # Re-exports lazy + _CliPackageModule compat (from cli import X y from cli.parser import X)
-│   │   ├── constants.py     # PRODUCT_NAME/SLUG, DEFAULT_*_PATH, puertos, tensor_split
-│   │   ├── env.py           # _load_installed_env, _env_path/value, _is_vllm_backend
-│   │   ├── models.py        # ManagedModel, ReplicaConfig/Record, ProbeTraceMetrics, Spinner
-│   │   ├── parser.py        # build_cli_parser, parse_cli_args, HelpFormatter
-│   │   ├── replica.py       # replica matrix, render_llamaswap_config
-│   │   ├── server_commands.py # build_llama/vllm_server_command, normalize_server_overrides
-│   │   ├── gateway.py       # dedup, Responses proxy, tool-repair, manager_hint
-│   │   ├── crash_bundle.py  # collector crash-bundle (502/unload/guard/socket) todos motores, caps journal 12k/nvidia 2k
-│   │   ├── raw_log.py       # raw ring api-raw-requests.log últimas 10 (1 MiB cap, fallback /tmp)
-│   │   └── daemon.py        # daemon_mode, auto-watch, build_info_text, show_info
-│   ├── _cli_impl.py         # Implementación legacy completa (20k líneas) — fallback para símbolos aún no extraídos
-│   ├── install.py           # Instalador user/system, prompts, resolve_* (fuente de verdad)
-│   ├── llamacpp_api_install.py  # Entry point `llm-server`
-│   ├── command_router.py    # Ruteo API -> llama-swap
-│   ├── managed_commands.py  # Comandos `add`/`run`/`update`/`validate`
-│   ├── auto_performance.py / auto_perf_runner.py
-│   ├── dependencies.py      # Chequeo deps
-│   ├── bundle/              # install_llamacpp_stack.sh, common.sh, defaults YAML
-│   │   └── llama_server_defaults.yaml
-│   └── migrations/          # Migraciones de conf.json
-├── configs/history/         # Snapshots de autotuning
-├── docs/
-│   ├── LLM_INSTALL.md       # Guía canónica para LLMs (Q1-Q8, matriz, comandos)
-│   ├── DFLASH-SPEC.md       # MTP vs DFlash2, VRAM medido, ctx_size_draft, logits
-│   ├── VLLM-BETA.md
-│   ├── LOCAL_OLLAMA_SETUP.md
-│   ├── arg-hyphen-conventions.md
-│   └── flags_llamacpp
-├── tests/                   # pytest (ver §7)
-├── tools/                   # bench/verify scripts
-├── skills/llm-server-autotune/ # Skill de autotuning
-├── templates/               # Templates de config
-├── Dockerfile / Dockerfile.llamacpp / Dockerfile.vllm
-├── docker-compose-vllm.yaml
-├── pyproject.toml           # deps proyecto: hf-transfer, huggingface-hub, pyyaml, requests, optuna
-├── uv.lock                  # lockfile determinista (usar con `uv sync`)
-├── requirements.txt         # mirror mínimo de deps (legacy, preferir pyproject/uv)
-└── README.md
+llamacpp_stack/
+  cli.py                # shim <400 líneas; re-exports de cli/
+  cli/                  # constants, env, models, parser, replica, server_commands,
+                        # gateway, crash_bundle, raw_log, daemon
+  _cli_impl.py          # implementación legacy (~20k líneas) — zona caliente
+  install.py            # fuente de verdad del instalador (prompts/flags/resolve_*)
+  exllama_server.py     # backend EXL3 legacy (en retirada)
+  bundle/               # install_llamacpp_stack.sh, defaults YAML
+  migrations/           # migraciones de conf.json
+configs/history/        # snapshots de autotuning (guardar aquí cada conf aceptada)
+docs/                   # DFLASH-SPEC, PERF-BASELINE, KV-cache, placement, install
+.opencode/memory/       # MEMORIA DEL PROYECTO (versionada)
+.opencode/skills/       # SKILLS DEL PROYECTO (única ubicación escaneada)
+tests/                  # pytest; markers real_model
+tools/                  # bench/patch/verify
 ```
 
-Ficheros de **instalación real** (no editar `config.yaml` a mano):
+Ficheros de instalación real (**no editar `config.yaml` a mano**):
 
 | Propósito | user mode | system mode |
 |---|---|---|
-| Settings globales | `~/.config/llm-server/conf.json` | `/etc/llm-server/conf.json` |
-| Catálogo modelos | `~/.local/state/llm-server/catalog.json` | `/var/lib/llm-server/catalog.json` |
-| Runtime generado | `~/.local/state/llm-server/config.yaml` | `/var/lib/llm-server/config.yaml` |
-| Env wrappers | `~/.config/llm-server/llm-server.env` | `/etc/llm-server/llm-server.env` |
-| Request log (rotado diario, split, 3 días) | `~/.local/state/llm-server/api-requests.log.YYYY-MM-DD[.partN]` + symlink `api-requests.log` → día activo; prune 3 días; fallback `/tmp` | `/var/lib/llm-server/api-requests.log.YYYY-MM-DD[.partN]` |
-| Raw ring (últimas 10 sin procesar) | `~/.local/state/llm-server/api-raw-requests.log` (fallback `/tmp/llm-server-api-raw-requests.log`, 1 MiB cap) | `/var/lib/llm-server/api-raw-requests.log` |
+| Settings | `~/.config/llm-server/conf.json` | `/etc/llm-server/conf.json` |
+| Catálogo | `~/.local/state/llm-server/catalog.json` | `/var/lib/llm-server/catalog.json` |
+| Runtime | `~/.local/state/llm-server/config.yaml` | `/var/lib/llm-server/config.yaml` |
+| Env | `~/.config/llm-server/llm-server.env` | `/etc/llm-server/llm-server.env` |
+| Request log | `…/api-requests.log.YYYY-MM-DD[.partN]` (symlink al día activo; 3 días) | `/var/lib/llm-server/…` |
+| Raw ring | `…/api-raw-requests.log` (10 últimas, 1 MiB, fallback `/tmp`) | `/var/lib/llm-server/…` |
 
----
+## 5. Flujos canónicos
 
-## 5. Setup de desarrollo (con `uv`)
-
+**Tests**
 ```bash
-# 0. uv (si falta)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-# o: pipx install uv
-
-# 1. Clonar y entrar
-git clone <repo> && cd llamacpp-stack
-
-# 2. Crear venv y sincronizar deps (determinista)
-uv venv --python 3.12 .venv
-source .venv/bin/activate
-uv sync
-# alternativa editable explícita:
-uv pip install -e .
-
-# 3. Verificar CLI
-uv run llm-server --help
-uv run llm-server info
-uv run llm-server config-keys --format json | head -n 80
-
-# 4. Tests
-uv run pytest -q
-
-# 5. Instalación local de prueba (no toca sistema, sin servicios)
-uv run llm-server install --mode user --backend auto \
-  --llama-cpp-mode prebuilt \
-  --models-dir /tmp/llm-server-models \
-  --public-host 127.0.0.1 --public-port 11436 \
-  --no-api-auth --no-api-https --idle-ttl 300 \
-  --no-install-services --dry-run
-```
-
-> Para desarrollo con checkout sin `pip install` previo, el wrapper `./llamacpp_stack/bundle/install_llamacpp_stack.sh` sigue funcionando (crea bootstrap venv). Si lo usas desde un entorno `uv`, invócalo como `uv run bash llamacpp_stack/bundle/install_llamacpp_stack.sh ...`.
-
----
-
-## 6. Flujo de instalación asistida (para agentes)
-
-Si el usuario te pide instalar el gateway, sigue **estrictamente** `docs/LLM_INSTALL.md`:
-
-1. Ejecuta pre-checks (§1 de ese doc) y guarda outputs.
-2. Haz **Q1–Q8 en un solo bloque** (modo, models-dir, backend, método llama.cpp, red/puertos, auth/TLS, modelos iniciales, tuning). No re-preguntes lo ya respondido. En non-TTY usa defaults + flags explícitos.
-3. Ejecuta siempre primero con `--dry-run`, revisa el plan, luego sin `--dry-run`.
-4. Verifica con `llm-server info` + `curl /v1/models` + `curl /api/replicas`.
-5. No asumas `sudo`, puertos o descargas de GB sin confirmar.
-
-Comandos canónicos (variante `uv`):
-
-```bash
-# Nueva instalación user, auto, interactiva mínima
-uv run llm-server install --mode user --backend auto --models-dir /var/llamacpp_models --idle-ttl 300 --dry-run
-uv run llm-server install --mode user --backend auto --models-dir /var/llamacpp_models --idle-ttl 300
-
-# System (re-ejecuta con sudo -E interno si hace falta)
-uv run llm-server install --mode system --backend auto --models-dir /var/llamacpp_models --public-host 0.0.0.0 --public-port 11436
-
-# No interactivo / CI
-uv run python -m llamacpp_stack.install --mode user --backend auto --llama-cpp-mode prebuilt \
-  --models-dir /tmp/llm-server-models --public-host 127.0.0.1 --public-port 11436 \
-  --no-api-auth --no-api-https --idle-ttl 300 --no-install-services --dry-run
-```
-
----
-
-## 7. Tests y validación
-
-```bash
-# Todos (recomendado con uv)
 uv run pytest -q
 uv run pytest tests/test_managed_commands.py -q
-uv run pytest tests/test_llamacpp_install.py -q
-
-# Con verbose / filtro
 uv run pytest -v -k "replica or config_migrate"
-
-# Verificación de comandos llama.cpp generados
 uv run python tools/verify_llama_cmds.py
 ```
+`@pytest.mark.real_model` usa `stories260K.gguf` (~1,2 MiB) vía `tests/_real_test_model.py`.
+`LLM_SERVER_TEST_MODEL_OFFLINE=1` desactiva la descarga. El bench live exige
+`RUN_REAL_AUTO_PERF_E2E=1` y CUDA.
 
-Notas:
-- `pyproject.toml` define `pythonpath = ["."]`, `testpaths = ["tests"]` y el marker `real_model`.
-- Muchos tests usan fixtures/mocks para evitar GPU/descargas reales. Cambios que afecten hardware deben validarse en instalación real.
-- Los tests E2E/autotuning con modelo real (`@pytest.mark.real_model`) descargan bajo demanda el GGUF más pequeño válido de Hugging Face (`ggml-org/models::tinyllamas/stories260K.gguf`, ~1.2 MiB) a `models/` vía `tests/_real_test_model.py`. No hace falta colocar a mano un modelo grande. Overrides: `LLM_SERVER_TEST_GGUF_REPO`, `LLM_SERVER_TEST_GGUF_FILE`, `LLM_SERVER_TEST_GGUF_NAME`, `LLM_SERVER_TEST_MODEL_DIR`; `LLM_SERVER_TEST_MODEL_OFFLINE=1` desactiva la descarga (los tests se saltan). Warm-up en CI: `uv run python tests/_real_test_model.py`.
-- El benchmark live sigue gateado por `RUN_REAL_AUTO_PERF_E2E=1` y requiere CUDA.
-- El render smoke de exllama usa el fixture `tests/fixtures/qwen3.8_chat_template.jinja` (plantilla real, byte-idéntica a la del 27B) en vez de leer `/var/llamacpp_models/...`; override con `LLM_SERVER_TEST_CHAT_TEMPLATE`.
-- Antes de push, revisa `git diff --cached` y evita commitear secretos.
-
----
-
-## 8. Docker
-
+**Instalación (asistida: seguir `docs/LLM_INSTALL.md` Q1–Q8, siempre `--dry-run` primero)**
 ```bash
-docker build -t llm-server -f Dockerfile .
-docker build -t llm-server-llamacpp -f Dockerfile.llamacpp .
-docker build -t llm-server-vllm -f Dockerfile.vllm .
-docker compose -f docker-compose-vllm.yaml up --build
+uv run llm-server install --mode user --backend auto --models-dir /var/llamacpp_models --idle-ttl 300 --dry-run
+uv run llm-server install --mode system --backend auto --models-dir /var/llamacpp_models
 ```
 
----
+**Cambiar configuración**
+```bash
+uv run llm-server config-migrate   # añade claves nuevas, nunca sobrescribe
+uv run llm-server update           # regenera config.yaml
+systemctl --user restart llm-server-manager llm-server-router
+uv run llm-server info && curl -s localhost:11435/v1/models | jq
+```
 
-## 9. Configuración
+**Ajuste de rendimiento aceptado** → guardar snapshot en `configs/history/` y entrada en
+`events.md`.
 
-- **No edites `config.yaml` a mano** — se regenera desde `conf.json` + `catalog.json` en cada `update`.
-- Tras editar `conf.json` o `catalog.json`:
+## 6. Skills del proyecto
 
-  ```bash
-  uv run llm-server config-migrate
-  uv run llm-server update
-  systemctl --user restart llm-server-manager llm-server-router
-  # system: sudo systemctl restart llm-server-manager llm-server-router
-  ```
+Ubicación única: **`.opencode/skills/<nombre>/SKILL.md`** (es el directorio que escanean los
+agentes; `skills/` en la raíz **no** se escanea). Antes de ejecutar el workflow, lee la skill
+completa — no improvises el procedimiento.
 
-- Inspección de claves soportadas:
+| Skill | Úsala cuando |
+|---|---|
+| `llm-server-ops-triage` | 502/500/429/503, stream cortado, modelo que no carga, latencia rara |
+| `llm-server-remote-deploy` | desplegar/verificar en `mpperez3@192.168.110.41` |
+| `llm-server-perf-bench` | comparar configuraciones, medir tok/s, investigar regresión |
+| `llm-server-model-tuning` | ajustar `ctx`/`batch`/`split`/quant/spec sin romper invariantes |
+| `llm-server-autotune` | añadir un modelo nuevo y derivar su configuración inicial |
+| `llm-server-installer-update` | install/update/migración user↔system, componentes ya instalados |
+| `llm-server-vllm-backend` | vLLM: parches, reasoning parity, draft vocab, `timings` ausentes |
+| `llm-server-mmproj-vision` | imágenes/visión, mmproj, modo lazy, "no procesa imágenes" |
+| `llm-server-kv-cache-diagnosis` | un turno corto reprocesa miles de tokens de prompt |
+| `llm-server-request-forensics` | "guarda esta request", captura #N, respuesta malformada, fixture |
+| `llamabench-config-advisor` | pedir "config óptima" para un modelo concreto |
 
-  ```bash
-  uv run llm-server config-keys
-  uv run llm-server config-keys --format json
-  uv run llm-server info
-  uv run llm-server hacks
-  ```
+El mismo índice, en formato inyectable, está en `.opencode/memory/skills.index.md`.
 
-- Defaults tunables: `llamacpp_stack/bundle/llama_server_defaults.yaml` (sampling, KV-cache, batching, GPU, context).
+## 7. Cómo mantener la memoria
 
----
+Al terminar trabajo significativo, actualiza **solo** lo que seguirá siendo cierto:
 
-## 10. Convenciones y estilo
+| Conocimiento | Fichero |
+|---|---|
+| Regla nueva del usuario | `.opencode/memory/invariants.md` |
+| Decisión con motivo | `.opencode/memory/decisions.md` |
+| Fallo/trampa descubierta | `.opencode/memory/known-issues.md` |
+| Qué pasó y con qué resultado | `.opencode/memory/events.md` |
+| Procedimiento repetible | `.opencode/skills/<n>/SKILL.md` |
+| Explicación larga de subsistema | `docs/` + puntero |
 
-- Python 3.12, `setuptools` (ver `pyproject.toml:18-19`).
-- Formato de claves: ver `docs/arg-hyphen-conventions.md` — distinguir `snake_case` en JSON vs `kebab-case` en CLI/flags.
-- Mantener idempotencia en `install.py` (`detect_existing_mode`, `choose_default_swap_port`, preservación de `models-dir`/certs/puertos en updates).
-- Mensajes de instalador: preguntar antes de escribir en disco, usar `sudo`, abrir puertos o descargar modelos.
-- Commits: mensajes concisos, sin secretos, con `git status`/`git diff` revisados.
+Reglas: una entrada por hecho, con fuente (fecha/commit/sesión/log), alcance explícito, y
+actualiza `updated:` del frontmatter. Nunca guardes secretos. Una memoria con datos viejos es
+peor que no tener memoria. Detalle en `.opencode/memory/INDEX.md`.
+`tests/test_project_memory.py` valida la estructura: si falla, la memoria está corrupta.
 
----
+## 8. Convenciones
 
-## 11. Troubleshooting (resumen)
+- Python 3.12, `setuptools`. Claves: `snake_case` en JSON, `kebab-case` en CLI
+  (`docs/arg-hyphen-conventions.md`).
+- Idempotencia en `install.py` (`detect_existing_mode`, `choose_default_swap_port`,
+  preservación de `models-dir`/certs/puertos).
+- Preguntar antes de escribir en disco, usar `sudo`, abrir puertos o descargar modelos.
+- Commits concisos y sin secretos; revisar `git status` / `git diff --cached`.
+- **No modificar la instalación global de opencode** (`~/.config/opencode`) para resolver
+  problemas de este repo: los recursos del proyecto van dentro del proyecto.
 
-- **API 502 / Connection refused :11436**: `llama-server` crasheó en load (OOM, ctx excesivo, draft MTP incompatible). Buscar `bundle_ref` en JSON 502 y `*_with_bundle` en log rotado `api-requests.log.YYYY-MM-DD[.partN]`; `uv run llm-server logs --lines 200 --journal` trae journal + hint `nvidia-smi`; raw body de últimas 10 sin procesar en `api-raw-requests.log` (ring 1 MiB cap, fallback `/tmp`).
-- **Setting no visible**: confirmar `info` muestra el `mode` correcto, luego `config-migrate && update && restart`. `config-migrate` añade `logging.requests_log` con defaults si falta, nunca sobrescribe valores existentes, segunda pasada idempotente.
-- **GPU equivocada**: inspeccionar `CUDA_VISIBLE_DEVICES`/`--device`/`--tensor-split` en `ps`/`logs`.
-- **Contexto pequeño en cliente**: `curl /v1/models | jq` tiene el real; el cliente puede tener metadata cacheada.
+## 9. Troubleshooting rápido
 
-Ver `README.md#Troubleshooting` y `docs/LLM_INSTALL.md#8`.
+| Síntoma | Primer paso |
+|---|---|
+| 502 al cargar | `bundle_ref` del JSON + `*_with_bundle` en el log rotado |
+| 500 `failed to start command` | `PATH` de llama-swap sin `~/.local/bin` |
+| 429 | `LLM_SERVER_MAX_CONCURRENT_PER_MODEL`, no es fallo del motor |
+| 503 `model_loading` | Otro load en curso; no forzar |
+| 0,27 t/s | Offload a CPU: revisar `tensor_split`/`CUDA_VISIBLE_DEVICES` |
+| Sin `slot print_timing` | Normal en EXL3/buun/vLLM; usar `timings` y `Activity` |
+| Contexto que no cuadra | `curl :11435/v1/models`; el cliente puede cachear |
 
----
+Detalle y causas raíz: `.opencode/memory/known-issues.md`, `README.md#Troubleshooting`,
+`docs/LLM_INSTALL.md#8`.
 
-## 12. Seguridad
+## 10. Referencias
 
-- No commitear `api_key`, claves privadas, certs, `api-requests.log`, `catalog.json` con rutas privadas ni `*.env`.
-- Preferir variables de entorno o secretos gestionados por el instalador.
-- Bind privado o HTTPS+auth si se expone fuera de red confiable.
-- `git diff --cached` + secret scan antes de push a rama pública.
+- `README.md` — overview, API, configuración, troubleshooting.
+- `docs/LLM_INSTALL.md` — checklist canónico de instalación para agentes.
+- `docs/runtime-placement-policy.md` — placement, warmer, eviction.
+- `docs/DFLASH-SPEC.md` — MTP vs DFlash2, presupuesto de VRAM, parches.
+- `docs/kv-cache-reuse-hybrid-qwen35.md` — por qué se reprocesa el prompt.
+- `docs/PERF-BASELINE-4090-QWEN38-27B.md` — baseline medido y protocolo de medición.
+- `docs/VLLM-BETA.md`, `docs/arg-hyphen-conventions.md`, `docs/flags_llamacpp`.
 
----
-
-## 13. Referencias
-
-- `README.md` — overview, arquitectura, API, troubleshooting.
-- `docs/LLM_INSTALL.md` — checklist canónico para agentes (pre-checks, Q1–Q8, matriz, comandos, verificación).
-- `llamacpp_stack/install.py` — fuente de verdad de prompts/flags (`prompt_bool`, `prompt_choice`, `resolve_*`, `build_cli_parser`).
-- `docs/DFLASH-SPEC.md` — MTP vs DFlash2: presupuesto de VRAM medido, trampa `ctx_size_draft:0`, coste de `--logits-all`, compat EXL3+DFlash2, patch requerido, y **la nota de que el servicio corre un snapshot (§8)**.
-- `docs/kv-cache-reuse-hybrid-qwen35.md` — por qué un turno que añade ~3k tokens reprocesa ~30k: `preserve_thinking=false` + plantilla posicional de Qwen3.5, checkpoints de modelo híbrido (reuse = último checkpoint ≤ LCP), captura/diff (`tools/compare_prompt_captures.py`) y palancas.
-- `docs/PERF-BASELINE-4090-QWEN38-27B.md` — baseline medido en esta máquina (264K: 1272 prefill / 57-58 decode), efecto del driver 615, barrido de codecs KV (turbo4 vs turbo8/f16/q8_0), VBR a 264K, A/B buun vs exllamav3, negativos (threads/CCD, draft tuning) y **protocolo de medición** (parar servicios, nonce por request, timings del servidor, seed fijo para drafts). Cliente: `tools/bench_chat_timings.py`.
-- `docs/VLLM-BETA.md`, `docs/LOCAL_OLLAMA_SETUP.md`, `docs/arg-hyphen-conventions.md`, `docs/flags_llamacpp`, `docs/lllamacpp_flags_API.md`.
-- `skills/llm-server-autotune/SKILL.md` — loop de autotuning.
-
----
-
-*Última actualización: 2026-09-04. Si añades una dependencia, usa `uv add` y commitea `uv.lock`.*
+*Última actualización: 2026-11-12. Si añades una dependencia, usa `uv add` y commitea `uv.lock`.*

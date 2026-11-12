@@ -121,6 +121,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     migrate_server_config = getattr(_cli_mod, "migrate_server_config")
     print_config_keys = getattr(_cli_mod, "print_config_keys")
     vllm_draft_vocab = getattr(_cli_mod, "vllm_draft_vocab")
+    maintenance_command = getattr(_cli_mod, "maintenance_command")
     refresh_templates = getattr(_cli_mod, "refresh_templates")
     remove_models = getattr(_cli_mod, "remove_models")
     remove_orphan_models = getattr(_cli_mod, "remove_orphan_models")
@@ -319,6 +320,16 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     subparsers["config-keys"] = p_config_keys
     p_config_keys.set_defaults(func=print_config_keys)
     p_config_keys.add_argument("--format", choices=("text", "json"), default="text")
+
+    p_maint = sub.add_parser(
+        "maintenance",
+        help="Toggle maintenance mode (local-only, or redirect all requests to one model)",
+    )
+    subparsers["maintenance"] = p_maint
+    p_maint.set_defaults(func=maintenance_command)
+    p_maint.add_argument("action", nargs="?", default="status",
+                         choices=("on", "off", "status", "enable", "disable"))
+    p_maint.add_argument("--model", default=None, help="model id every request is redirected to")
 
     p_draft_vocab = sub.add_parser(
         "vllm-draft-vocab",

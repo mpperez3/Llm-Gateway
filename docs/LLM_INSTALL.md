@@ -341,6 +341,22 @@ llm-server logs --lines 200 --journal | grep timing
 *   `docs/VLLM-BETA.md`, `docs/LOCAL_OLLAMA_SETUP.md`, `docs/arg-hyphen-conventions.md`.
 *   `llamacpp_stack/bundle/llama_server_defaults.yaml` - defaults y presets por `gpu_count`.
 
-## LLM Server Autotune Skill
+## Skills y memoria del proyecto (para agentes)
 
-`skills/llm-server-autotune/SKILL.md` - Loop automático para optimizar `qwen3.8` etc. tras `add` o `optimizar`. Valida con `parallel 2/3` y guarda snapshot en `configs/history/`.
+Las skills viven en **`.opencode/skills/<nombre>/SKILL.md`** (única ubicación escaneada) y la
+memoria persistente en **`.opencode/memory/`**:
+
+| Recurso | Para qué |
+|---|---|
+| `AGENTS.md` | Router de entrada; se inyecta en cada sesión |
+| `.opencode/memory/invariants.md` | Reglas duras del usuario (contexto máximo, no bajar quant…) |
+| `.opencode/memory/known-issues.md` | Síntomas ya vistos y su causa raíz |
+| `.opencode/memory/events.md` | Qué pasó, cuándo y con qué resultado |
+| `.opencode/skills/llm-server-installer-update` | Install/update/migración user↔system |
+| `.opencode/skills/llm-server-ops-triage` | 502/500/429/503, stream cortado, modelo que no carga |
+| `.opencode/skills/llm-server-remote-deploy` | Desplegar en `mpperez3@192.168.110.41` |
+| `.opencode/skills/llm-server-model-tuning` | Ajustar ctx/batch/split/spec sin romper invariantes |
+| `.opencode/skills/llm-server-perf-bench` | Medir tok/s sin autoengañarse |
+| `.opencode/skills/llm-server-autotune` | Derivar la config inicial de un modelo nuevo |
+
+`tests/test_project_memory.py` valida que skills y memoria siguen siendo coherentes.

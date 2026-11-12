@@ -109,6 +109,10 @@ tests/test_llama_swap_logging.py
 tests/test_vllm_spec_metrics.py
 /.omo/
 /.serena/
-/.opencode/
+# .opencode/ contiene node_modules y estado local, pero la memoria y las skills del
+# proyecto SON recursos versionados (las leen los agentes en cada sesión).
+/.opencode/*
+!/.opencode/memory/
+!/.opencode/skills/
 /.hypothesis/
 /.github/

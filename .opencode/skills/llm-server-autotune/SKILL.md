@@ -1,6 +1,6 @@
 ---
 name: llm-server-autotune
-description: Auto-tune LLM Server models for max tok/s with minimal loss. Triggers when user adds a new GGUF or asks to optimize. Loop: probe VRAM, derive ctx/parallel/tensor_split/batch, validate 2x50K (or Nx) parallel, save snapshot to configs/history.
+description: Auto-tuning inicial de un modelo nuevo en LLM Server (derivar ctx/parallel/tensor_split/batch desde la VRAM y validar concurrencia). Úsala SIEMPRE que se añada un GGUF o safetensors nuevo, cuando haya `auto_ctx_failed` u OOM al cargar, o cuando pidan la configuración inicial de un modelo. Para afinar un modelo ya en producción usa `llm-server-model-tuning`; para medir usa `llm-server-perf-bench`.
 ---
 
 # LLM Server Autotune
@@ -39,7 +39,7 @@ cat ~/.local/state/llm-server/catalog.json | jq '.[] | {model_id,ctx_size,tensor
 ```bash
 # edit catalog.json directly or via update
 python3 -c "import json,pathlib; p=pathlib.Path('~/.local/state/llm-server/catalog.json').expanduser(); ..."
-python3 /tmp/run_sync.py  # sync_config_from_server_config_for_startup
+uv run llm-server config-migrate && uv run llm-server update  # re-render config.yaml
 llm-server unload <model> && sleep 3 && curl .../v1/chat/completions --max_tokens 5 # warm
 # verify slots
 curl -sk http://127.0.0.1:11436/upstream/<model>/slots | jq '[.[].n_ctx]'
@@ -50,7 +50,7 @@ curl -sk http://127.0.0.1:11436/upstream/<model>/slots | jq '[.[].n_ctx]'
 - If `parallel=3`: 9 queries in triples of 3
 - If `parallel=1`: 4 queries sequential, no `429`
 - Check `429 overloaded` vs `503 model_loading`: `429` = limit `LLM_SERVER_MAX_CONCURRENT_PER_MODEL` (# legacy HEIMDALL_GATEWAY_* still accepted), `503` = `claim_loading` (engine not detected if beellama)
-- Generic engine fix: `cli.py:7609` `if "llama-server" in Path(arg).name` for any `*llama-server*` (beellama, future)
+- Generic engine detection lives in `llamacpp_stack/cli/server_commands.py` (any `*llama-server*` binary); no model-specific branches
 
 ### 5. Measure tok/s & Iterate
 - Prompt `50K` -> `prompt_tokens / elapsed` (`~8s` warm, `~68s` cold)
@@ -88,7 +88,13 @@ mkdir -p configs/history
 ## References
 
 - Base: `jr2804/llama-cpp-optimizer` (retrieved 2026-09-02, MIT) - generic llama.cpp optimizer; adapted for LLM Server `catalog.json` loop and `parallel`/`tensor_split`/`claim_loading` fixes.
-- Local: `llamacpp_stack/cli.py:7609` generic engine detection, `cli.py:4281 claim_loading`, `cli.py:18123 auto_update_watch`, `bundle/llama_server_defaults.yaml:37 parallel`
+- Local: `llamacpp_stack/cli/server_commands.py` (engine detection), `llamacpp_stack/cli/replica.py` (placement/config render), `llamacpp_stack/bundle/llama_server_defaults.yaml` (`parallel`)
+
+## Skills relacionadas
+
+- Afinar un modelo ya desplegado: `llm-server-model-tuning`.
+- Medir de verdad: `llm-server-perf-bench`.
+- Desplegar el resultado: `llm-server-remote-deploy`.
 
 ## Safety
 

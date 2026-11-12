@@ -1418,6 +1418,30 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertIn('LLAMA_SERVER_LIB_DIR="$(dirname "$LLAMA_SERVER_REAL")"', wrapper)
             self.assertIn('export LD_LIBRARY_PATH="$LLAMA_SERVER_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"', wrapper)
 
+    def test_wrappers_export_bin_dir_on_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = InstallLayout(
+                mode="system",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            expected = f'export PATH="{layout.bin_dir}:'
+            self.assertIn(expected, render_llamaswap_wrapper(layout))
+            self.assertIn(expected, render_manager_wrapper(layout))
+
     def test_render_vllm_server_wrapper_translates_llama_server_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
