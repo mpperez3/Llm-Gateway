@@ -16619,6 +16619,38 @@ def _start_ninfer_warmup(catalog_path: Path, host: str, port: int) -> None:
             models = load_catalog(Path(catalog_path))
         except Exception:
             return
+        try:
+            with _url.urlopen(f"{base}/v1/models", timeout=5) as resp:
+                published = {
+                    str(item.get("id") or "")
+                    for item in json.loads(resp.read().decode("utf-8")).get("data", [])
+                }
+        except Exception:
+            published = set()
+
+        def _warm_once(route_id: str) -> bool:
+            payload = json.dumps(
+                {
+                    "model": route_id,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "temperature": 0,
+                }
+            ).encode("utf-8")
+            try:
+                request = _url.Request(
+                    f"{base}/v1/chat/completions",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _url.urlopen(request, timeout=1800) as resp:
+                    resp.read()
+                return resp.status == 200
+            except Exception:
+                return False
+
+        pending: list[str] = []
         for model in models:
             if str(getattr(model, "backend", "")).lower() != "ninfer":
                 continue
@@ -16626,31 +16658,33 @@ def _start_ninfer_warmup(catalog_path: Path, host: str, port: int) -> None:
                 replicas = int((getattr(model, "server_overrides", {}) or {}).get("replicas") or 0)
             except Exception:
                 replicas = 0
-            route_ids = [model.model_id] + [
+            derived = [model.model_id] + [
                 replica_model_id(model.model_id, idx) for idx in range(replicas)
             ]
+            # server_overrides.replicas counts copies including the base, so the
+            # derived list can invent __replica_N ids that are not published.
+            route_ids = [rid for rid in derived if rid in published] if published else derived
             for route_id in route_ids:
-                payload = json.dumps(
-                    {
-                        "model": route_id,
-                        "messages": [{"role": "user", "content": "ping"}],
-                        "max_tokens": 1,
-                        "temperature": 0,
-                    }
-                ).encode("utf-8")
-                try:
-                    request = _url.Request(
-                        f"{base}/v1/chat/completions",
-                        data=payload,
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with _url.urlopen(request, timeout=1800) as resp:
-                        resp.read()
+                if _warm_once(route_id):
                     log_api_event("ninfer_warmup_ok", {"model": route_id})
-                except Exception as exc:
-                    log_api_event("ninfer_warmup_failed", {"model": route_id, "error": str(exc)[:140]})
+                else:
+                    pending.append(route_id)
                 _time.sleep(1)
+        # A first request during the initial load gets a 5xx while the engine
+        # starts; retry instead of leaving the route cold.
+        attempts = 0
+        while pending and attempts < 20:
+            attempts += 1
+            _time.sleep(15)
+            still: list[str] = []
+            for route_id in pending:
+                if _warm_once(route_id):
+                    log_api_event("ninfer_warmup_ok", {"model": route_id, "attempt": attempts})
+                else:
+                    still.append(route_id)
+            pending = still
+        for route_id in pending:
+            log_api_event("ninfer_warmup_failed", {"model": route_id, "error": "still cold after retries"})
 
     import threading as _threading
 
