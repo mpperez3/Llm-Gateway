@@ -10881,13 +10881,24 @@ def _safe_realpath(path_str: str) -> str:
         return path_str
 
 
+_PUBLISHED_IDS_CACHE: dict[tuple[str, int], tuple[float, set[str]]] = {}
+_PUBLISHED_IDS_TTL_S = 1.5
+
+
 def get_published_model_ids(host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> set[str]:
     try:
         host = _normalize_client_host(host)
+        key = (str(host), int(port))
+        now = time.monotonic()
+        cached = _PUBLISHED_IDS_CACHE.get(key)
+        if cached is not None and now - cached[0] <= _PUBLISHED_IDS_TTL_S:
+            return set(cached[1])
         r = requests.get(f"http://{host}:{port}/v1/models", timeout=1.5)
         if r.status_code != 200:
             return set()
-        return {item.get("id") for item in r.json().get("data", []) if item.get("id")}
+        result = {item.get("id") for item in r.json().get("data", []) if item.get("id")}
+        _PUBLISHED_IDS_CACHE[key] = (now, set(result))
+        return result
     except Exception:
         return set()
 
@@ -17246,11 +17257,23 @@ def _candidate_request_log_paths(explicit_path: Path | None = None) -> list[Path
     return bases
 
 
+_CONFIG_PORT_MAP_CACHE: dict[str, tuple[float, int, dict[str, int]]] = {}
+
+
 def get_config_model_port_map(config_path: Path | str | None) -> dict[str, int]:
     if config_path is None:
         return {}
     try:
-        payload = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+        path = Path(config_path)
+        stat = path.stat()
+    except Exception:
+        return {}
+    key = str(path)
+    cached = _CONFIG_PORT_MAP_CACHE.get(key)
+    if cached is not None and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return dict(cached[2])
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
     try:
@@ -17260,7 +17283,9 @@ def get_config_model_port_map(config_path: Path | str | None) -> dict[str, int]:
     models = payload.get("models") or {}
     if not isinstance(models, dict):
         return {}
-    return {str(model_id): start_port + idx for idx, model_id in enumerate(models.keys())}
+    result = {str(model_id): start_port + idx for idx, model_id in enumerate(models.keys())}
+    _CONFIG_PORT_MAP_CACHE[key] = (stat.st_mtime, stat.st_size, result)
+    return dict(result)
 
 
 
@@ -17293,11 +17318,27 @@ def _find_llama_server_process_for_replica(
             return proc
     return None
 
+_REPLICA_SYNC_GUARD = threading.Lock()
+_REPLICA_SYNC_LAST_AT = 0.0
+
+
 def sync_replica_runtime_state(
     catalog: list[ManagedModel],
     config_path: Path | str | None = None,
     global_replica_config: dict[str, object] | None = None,
+    *,
+    min_interval_s: float = 0.0,
 ) -> None:
+    # Hot-path callers throttle this: it scans /proc and shells out to
+    # nvidia-smi (~165 ms), and the routing decision does not need fresher
+    # process/pid bookkeeping than a few seconds.
+    global _REPLICA_SYNC_LAST_AT
+    if min_interval_s > 0:
+        _now = time.monotonic()
+        with _REPLICA_SYNC_GUARD:
+            if _now - _REPLICA_SYNC_LAST_AT < min_interval_s:
+                return
+            _REPLICA_SYNC_LAST_AT = _now
     port_by_model = get_config_model_port_map(config_path)
     route_index = _llamaswap_route_index(config_path)
     model_by_port = {port: model_id for model_id, port in port_by_model.items()}
@@ -18026,7 +18067,7 @@ def start_ctx_metadata_server(args):
                             if model_entry is not None:
                                 replica_defaults = resolve_global_replica_config(args)
                                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
-                                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                                sync_replica_runtime_state(catalog, args.config, replica_defaults, min_interval_s=5.0)
                                 upstream_model_name, _, is_replica_request = select_replica_for_request(
                                     model_entry,
                                     proxy_payload,
@@ -18605,7 +18646,7 @@ def start_ctx_metadata_server(args):
             elif model_entry is not None:
                 replica_defaults = resolve_global_replica_config(args)
                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
-                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                sync_replica_runtime_state(catalog, args.config, replica_defaults, min_interval_s=5.0)
                 upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
                     model_entry,
                     payload,
@@ -18934,7 +18975,7 @@ def start_ctx_metadata_server(args):
             elif model_entry is not None:
                 replica_defaults = resolve_global_replica_config(args)
                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
-                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                sync_replica_runtime_state(catalog, args.config, replica_defaults, min_interval_s=5.0)
                 upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
                     model_entry,
                     payload,
@@ -20166,7 +20207,7 @@ def start_ctx_metadata_server(args):
             elif model_entry is not None:
                 replica_defaults = resolve_global_replica_config(args)
                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
-                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                sync_replica_runtime_state(catalog, args.config, replica_defaults, min_interval_s=5.0)
                 upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
                     model_entry,
                     payload,
@@ -21675,7 +21716,7 @@ def start_ctx_metadata_server(args):
             elif model_entry is not None:
                 replica_defaults = resolve_global_replica_config(args)
                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
-                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                sync_replica_runtime_state(catalog, args.config, replica_defaults, min_interval_s=5.0)
                 upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
                     model_entry,
                     payload,
@@ -21913,7 +21954,7 @@ def start_ctx_metadata_server(args):
             if model_entry is not None:
                 replica_defaults = resolve_global_replica_config(args)
                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
-                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                sync_replica_runtime_state(catalog, args.config, replica_defaults, min_interval_s=5.0)
                 upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
                     model_entry,
                     payload,
