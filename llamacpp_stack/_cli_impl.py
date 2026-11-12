@@ -7362,8 +7362,12 @@ def select_replica_for_request(
             _idle_threshold = float(_resolve_affinity_spillover_config().get("idle_threshold_s", 60))
         except Exception:
             _idle_threshold = 60.0
-        _fallback_key = ":fallback:" in str(affinity_key)
-        owner_now = None if _fallback_key else REPLICA_ROUTER_STATE.owner_of(affinity_key, now)
+        # Fallback keys hash the conversation's first user message, so they are
+        # conversations too: splitting one across replicas throws away its KV
+        # cache (an 85k-token agent prompt re-prefilled for ~54 s) and the client
+        # times out. New conversations still spread; an owned one stays put
+        # until the idle-replica preload moves it.
+        owner_now = REPLICA_ROUTER_STATE.owner_of(affinity_key, now)
         if owner_now is not None and owner_now in members:
             _ninfer_schedule_idle_preload(
                 affinity_key,
