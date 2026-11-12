@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import errno
 import warnings
 import hashlib
@@ -4167,6 +4168,9 @@ def shell_quote(v):
     return "'" + v.replace("'", "'\"'\"'") + "'"
 
 
+_SERVER_CONFIG_CACHE: dict[str, tuple[float, int, dict]] = {}
+
+
 def _load_server_config_payload(args = None) -> dict:
     if args is not None and getattr(args, "idle_ttl", None) is not None:
         pass
@@ -4190,6 +4194,10 @@ def _load_server_config_payload(args = None) -> dict:
         try:
             if not p.exists():
                 continue
+            st = p.stat()
+            cached = _SERVER_CONFIG_CACHE.get(str(p))
+            if cached is not None and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                return copy.deepcopy(cached[2])
             payload = _json_loads_allow_comments(
                 p.read_text(encoding="utf-8"),
                 path_desc=str(p),
@@ -4201,7 +4209,12 @@ def _load_server_config_payload(args = None) -> dict:
                         p.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
                     except Exception:
                         pass
-                return normalized
+                try:
+                    st2 = p.stat()
+                    _SERVER_CONFIG_CACHE[str(p)] = (st2.st_mtime, st2.st_size, normalized)
+                except Exception:
+                    pass
+                return copy.deepcopy(normalized)
         except Exception:
             continue
     return {}
@@ -7104,7 +7117,7 @@ def is_fallback_affinity_key(affinity_key: str) -> bool:
     return ":fallback:" in str(affinity_key or "")
 
 
-def _query_gpu_memory_snapshot_cached(ttl_s: float = 1.0) -> dict[int, dict[str, float]]:
+def _query_gpu_memory_snapshot_cached(ttl_s: float = 3.0) -> dict[int, dict[str, float]]:
     now = time.monotonic()
     with REPLICA_ROUTER_STATE.lock:
         ts, snap = REPLICA_ROUTER_STATE.gpu_snapshot
@@ -10927,7 +10940,16 @@ def get_loaded_model_ids(host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> 
         return set()
 
 
+_LLAMA_PROC_CACHE: tuple[float, list[dict]] = (-1.0, [])
+_LLAMA_PROC_TTL_S = 2.0
+
+
 def get_llama_server_processes() -> list[dict]:
+    global _LLAMA_PROC_CACHE
+    _now = time.monotonic()
+    _ts, _cached = _LLAMA_PROC_CACHE
+    if _ts >= 0.0 and _now - _ts <= _LLAMA_PROC_TTL_S:
+        return [dict(item) for item in _cached]
     try:
         result = subprocess.run(
             [
@@ -10981,6 +11003,7 @@ def get_llama_server_processes() -> list[dict]:
             except Exception:
                 port = None
         processes.append({"pid": pid, "cmdline": cmdline, "model_path": _safe_realpath(model_path), "port": port})
+    _LLAMA_PROC_CACHE = (time.monotonic(), [dict(item) for item in processes])
     return processes
 
 
