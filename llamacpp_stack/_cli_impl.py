@@ -6302,6 +6302,15 @@ class ReplicaRouterState:
                 if remaining <= 0:
                     self.base_busy_since.pop(replica_id, None)
                 self.base_last_used[replica_id] = time.monotonic()
+            # The NInfer balancer counts *active* selections in a window; drop the
+            # one that just finished or a completed request keeps the route
+            # looking full until the TTL expires.
+            try:
+                _bucket = _NINFER_RECENT.get(replica_id)
+                if _bucket:
+                    _bucket.pop(0)
+            except Exception:
+                pass
 
     def base_load(self, model_id: str) -> int:
         with self.lock:
@@ -7369,6 +7378,45 @@ def select_replica_for_request(
         # until the idle-replica preload moves it.
         owner_now = REPLICA_ROUTER_STATE.owner_of(affinity_key, now)
         if owner_now is not None and owner_now in members:
+            # Concurrent burst: the conversation stays sticky while the owner has
+            # a free lane. Once it is busy, the overflow goes to the other replica
+            # (which prefills this context) instead of queuing on one GPU for
+            # minutes. The affinity owner does not change.
+            _others = [m for m in members if m != owner_now]
+            # Long turns: a request can hold a lane for minutes, so the owner is
+            # "busy" for anything selected within this window, not just 3 s.
+            _burst_window = 180.0
+            _owner_busy = any(now_sel - t <= _burst_window for t in _recent.get(owner_now, []))
+            _spill = None
+            if _owner_busy:
+                for _m in _others:
+                    try:
+                        _cap = max(1, _target_capacity(_m))
+                    except Exception:
+                        _cap = 1
+                    _busy = sum(1 for t in _recent.get(_m, []) if now_sel - t <= _burst_window)
+                    if _busy >= _cap:
+                        continue
+                    # Only spill to a route that is actually serving: a loading
+                    # replica would return 502 (upstream exited prematurely).
+                    try:
+                        _port = get_config_model_port_map(Path(config_path) if config_path is not None else Path(DEFAULT_CONFIG_PATH)).get(_m)
+                        if _port and _probe_target_health is not None:
+                            _h = _probe_target_health(str(_m), pid=0, port=int(_port), state=_TargetState.READY, capacity=_cap, timeout_s=1.0)
+                            if _h.state is not _TargetState.READY:
+                                continue
+                    except Exception:
+                        pass
+                    _spill = _m
+                    break
+            if _spill is not None:
+                with REPLICA_ROUTER_STATE.lock:
+                    _NINFER_RECENT.setdefault(_spill, []).append(now_sel)
+                    _NINFER_LAST[_spill] = now_sel
+                log_api_event("replica_spill_concurrent", {
+                    "model": base_model.model_id, "owner": owner_now, "spill": _spill,
+                })
+                return _spill, affinity_key, _spill in replica_ids
             _ninfer_schedule_idle_preload(
                 affinity_key,
                 owner_now,
