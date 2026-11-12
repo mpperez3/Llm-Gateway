@@ -19407,6 +19407,22 @@ def start_ctx_metadata_server(args):
                     # backend-agnostic here.
                     _rb_field = "thinking_budget_tokens"
                     _rb_defaults = resolve_llama_server_defaults(args)
+                if _rb_backend == "ninfer" and _rb_defaults is not None and _positive_int(upstream_payload.get("max_tokens")) is None:
+                    # ninfer's default output limit without max_tokens is the
+                    # budget that fits the free lanes, which can be tiny (1,711
+                    # tokens observed) and lets thinking hit the cap with no
+                    # visible answer. Give it the same generation cap the other
+                    # backends use (predict).
+                    try:
+                        _pred = _positive_int((_effective_llama_server_options(model_entry, _rb_defaults) or {}).get("predict"))
+                    except Exception:
+                        _pred = None
+                    if _pred:
+                        upstream_payload["max_tokens"] = _pred
+                        log_api_event(
+                            "ninfer_default_output_limit_applied",
+                            {"request_id": request_id, "model": model_name, "max_tokens": _pred},
+                        )
                 if _rb_field is not None and _rb_defaults is not None:
                     reasoning_budget, reasoning_budget_reason = resolve_request_reasoning_budget(
                         payload,
