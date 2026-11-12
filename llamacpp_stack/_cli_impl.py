@@ -17449,7 +17449,28 @@ def sync_replica_runtime_state(
                     rec.port = configured_port
                     rec.gpu_actual_mib = {}
                     rec.actual_mib = None
-                    if rec.status == "ready":
+                    # A missing host process is not proof of death: ninfer runs its
+                    # engine in a container, so the host process scan is always
+                    # empty and this used to mark a live route "cold" every 10 s.
+                    # Keep it ready while its port answers /health.
+                    _ready = False
+                    try:
+                        _port = int(rec.port or 0)
+                        if _port > 0 and _probe_target_health is not None:
+                            _health = _probe_target_health_cached(
+                                rid,
+                                pid=0,
+                                port=_port,
+                                state=_TargetState.READY,
+                                capacity=_target_capacity(rid),
+                                timeout_s=0.5,
+                            )
+                            _ready = _health is not None and _health.state is _TargetState.READY
+                    except Exception:
+                        _ready = False
+                    if _ready:
+                        rec.status = "ready"
+                    elif rec.status == "ready":
                         rec.status = "cold"
 
 
