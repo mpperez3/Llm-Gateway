@@ -18944,9 +18944,12 @@ def start_ctx_metadata_server(args):
                 _dedup_send_json_with_header(self, base, status=200, dedup_header="miss")
 
         def _handle_openai_chat_completions(self):
+            _phase: dict[str, float] = {"t0": time.perf_counter()}
             payload = self._read_json_body()
+            _phase["body"] = time.perf_counter()
             request_id = f"chat_req_{uuid.uuid4().hex}"
             log_api_event("openai_chat_request", {"request_id": request_id, "payload": _summarize_api_payload_for_log(payload)})
+            _phase["request_log"] = time.perf_counter()
             started_at = time.monotonic()
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
@@ -18969,13 +18972,16 @@ def start_ctx_metadata_server(args):
                 if vision_error:
                     self._send_json({"error": {"message": vision_error, "type": "server_error"}}, status=503)
                     return
+            _phase["resolve"] = time.perf_counter()
             if vision_target is not None:
                 upstream_model_name = vision_target
                 is_replica_request = True
             elif model_entry is not None:
                 replica_defaults = resolve_global_replica_config(args)
                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
+                _phase["published"] = time.perf_counter()
                 sync_replica_runtime_state(catalog, args.config, replica_defaults, min_interval_s=5.0)
+                _phase["sync"] = time.perf_counter()
                 upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
                     model_entry,
                     payload,
@@ -18990,6 +18996,7 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            _phase["select"] = time.perf_counter()
             conversation_key = resolve_request_conversation_key(payload, self.headers)
             conversation_token, conversation_start_reason = CONVERSATION_SWITCH_STATE.start(conversation_key, model_name)
             if conversation_start_reason == "model_changed":
@@ -19038,6 +19045,7 @@ def start_ctx_metadata_server(args):
             if _blocked:
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
+            _phase["gates"] = time.perf_counter()
             log_api_event(
                 "openai_chat_route_decision",
                 {
@@ -19051,6 +19059,29 @@ def start_ctx_metadata_server(args):
                     "router_state": replica_trace_state_for_base(model_name),
                 },
             )
+            _phase["decided"] = time.perf_counter()
+            try:
+                _p = _phase
+
+                def _ms(a: str, b: str) -> float:
+                    return round((_p.get(b, _p.get(a, _p["t0"])) - _p.get(a, _p["t0"])) * 1000, 1)
+
+                log_api_event(
+                    "openai_chat_phase_timing",
+                    {
+                        "request_id": request_id,
+                        "body_ms": _ms("t0", "body"),
+                        "request_log_ms": _ms("body", "request_log"),
+                        "resolve_ms": _ms("request_log", "resolve"),
+                        "published_ms": _ms("resolve", "published"),
+                        "sync_ms": _ms("published", "sync"),
+                        "select_ms": _ms("sync", "select"),
+                        "gates_ms": _ms("select", "gates"),
+                        "total_to_decision_ms": round((_p.get("decided", _p["t0"]) - _p["t0"]) * 1000, 1),
+                    },
+                )
+            except Exception:
+                pass
             log_model_runtime_snapshot(
                 "openai_chat_runtime_before_upstream",
                 upstream_model_name or model_name,
