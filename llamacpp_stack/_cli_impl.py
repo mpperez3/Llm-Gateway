@@ -7417,15 +7417,13 @@ def select_replica_for_request(
                     "model": base_model.model_id, "owner": owner_now, "spill": _spill,
                 })
                 return _spill, affinity_key, _spill in replica_ids
-            _ninfer_schedule_idle_preload(
-                affinity_key,
-                owner_now,
-                members,
-                payload,
-                config_path,
-                _idle_threshold,
-                capacity_of=_target_capacity,
-            )
+            # The idle-replica preload ran on every owned turn and migrated the
+            # conversation to whichever route was idle >60 s. With a single long
+            # conversation that ping-pongs: 519 preloads today, each re-prefilling
+            # the full prompt on the other card, and the traffic alternated in
+            # blocks instead of using both GPUs. Affinity now stays put; new
+            # conversations distribute by round-robin and same-conversation
+            # overflow still spills to the other replica when the owner is full.
             _NINFER_LAST[owner_now] = now_sel
             with REPLICA_ROUTER_STATE.lock:
                 _NINFER_RECENT.setdefault(owner_now, []).append(now_sel)
