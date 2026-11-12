@@ -486,7 +486,7 @@ def resolve_request_reasoning_budget(payload: dict[str, object], model, *, serve
         backend = fn(model) if fn else "llama.cpp"
     except Exception:
         backend = "llama.cpp"
-    if not isinstance(payload, dict) or backend not in {"llama.cpp", "vllm"}:
+    if not isinstance(payload, dict) or backend not in {"llama.cpp", "vllm", "ninfer"}:
         return None, "unsupported_backend"
     from .constants import DEFAULT_VLLM_GENERATION_LIMIT
     if any(k in payload for k in {"thinking_budget_tokens","reasoning_budget_tokens","thinking_token_budget"}):
