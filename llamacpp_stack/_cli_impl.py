@@ -16595,6 +16595,70 @@ def _next_llamaswap_guard_backend_port(public_port: int) -> int:
     return int(public_port) + 1000
 
 
+def _start_ninfer_warmup(catalog_path: Path, host: str, port: int) -> None:
+    """Load every NInfer route once, sequentially, after llama-swap is up.
+
+    The first client burst must not find a container cold: llama-swap answers 502
+    while the weights load (~90 s each, ~3 min if two load at once). Warming
+    sequentially keeps each load at its normal duration and runs in the
+    background, so serving is not blocked.
+    """
+    def _run() -> None:
+        import threading  # noqa: F401  (documented; thread started below)
+        import time as _time
+        import urllib.request as _url
+
+        base = f"http://{host}:{port}"
+        for _ in range(180):
+            try:
+                with _url.urlopen(f"{base}/v1/models", timeout=3) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                pass
+            _time.sleep(2)
+        try:
+            models = load_catalog(Path(catalog_path))
+        except Exception:
+            return
+        for model in models:
+            if str(getattr(model, "backend", "")).lower() != "ninfer":
+                continue
+            try:
+                replicas = int((getattr(model, "server_overrides", {}) or {}).get("replicas") or 0)
+            except Exception:
+                replicas = 0
+            route_ids = [model.model_id] + [
+                replica_model_id(model.model_id, idx) for idx in range(replicas)
+            ]
+            for route_id in route_ids:
+                payload = json.dumps(
+                    {
+                        "model": route_id,
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "max_tokens": 1,
+                        "temperature": 0,
+                    }
+                ).encode("utf-8")
+                try:
+                    request = _url.Request(
+                        f"{base}/v1/chat/completions",
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with _url.urlopen(request, timeout=1800) as resp:
+                        resp.read()
+                    log_api_event("ninfer_warmup_ok", {"model": route_id})
+                except Exception as exc:
+                    log_api_event("ninfer_warmup_failed", {"model": route_id, "error": str(exc)[:140]})
+                _time.sleep(1)
+
+    import threading as _threading
+
+    _threading.Thread(target=_run, daemon=True, name="ninfer-warmup").start()
+
+
 def run_llamaswap_guard(args) -> int:
     """Run llama-swap behind a small guard proxy that blocks upstream static autoloads."""
     listen_host = str(getattr(args, "listen_host", None) or getattr(args, "public_host", None) or DEFAULT_PUBLIC_HOST)
@@ -16612,6 +16676,14 @@ def run_llamaswap_guard(args) -> int:
         "--watch-config",
     ]
     child = subprocess.Popen(child_cmd)
+    try:
+        _start_ninfer_warmup(
+            Path(getattr(args, "catalog", None) or DEFAULT_CATALOG_PATH),
+            backend_host,
+            backend_port,
+        )
+    except Exception:
+        pass
 
     class GuardHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
