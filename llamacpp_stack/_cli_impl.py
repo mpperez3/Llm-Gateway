@@ -6306,7 +6306,7 @@ class ReplicaRouterState:
             # one that just finished or a completed request keeps the route
             # looking full until the TTL expires.
             try:
-                _bucket = _NINFER_RECENT.get(replica_id)
+                _bucket = _STATIC_ROUTE_RECENT.get(replica_id)
                 if _bucket:
                     _bucket.pop(0)
             except Exception:
@@ -7349,33 +7349,21 @@ def select_replica_for_request(
     replica_ids = [replica_model_id(base_model.model_id, idx) for idx in range(len(gpu_sets))]
     published = set(published_model_ids) if published_model_ids is not None else get_published_model_ids()
     published_replica_ids = [rid for rid in replica_ids if rid in published]
-    # NInfer replicas are statically one per GPU. New conversations balance
-    # across them; an existing conversation keeps its owner while that owner has
-    # a free slot, and spills to the other replica once it is full (2 lanes).
-    if (
-        str(getattr(base_model, "backend", "") or "").lower() == "ninfer"
-        and published_replica_ids
-        and not previous_response_id
-    ):
+    # Engines with static published replica routes (NInfer today; any backend
+    # that publishes <model>__replica_N as a real route) share one policy: new
+    # conversations spread, an existing conversation keeps its owner while it
+    # has a free slot, and the overflow spills to the other route when full.
+    if published_replica_ids and not previous_response_id:
         members = [base_model.model_id, *published_replica_ids]
         now_sel = time.monotonic()
         with REPLICA_ROUTER_STATE.lock:
-            _recent = _NINFER_RECENT
+            _recent = _STATIC_ROUTE_RECENT
             for _mid in members:
                 _recent[_mid] = [t for t in _recent.get(_mid, []) if now_sel - t <= 15.0]
-        # Fallback keys are a client-level bucket, not a conversation: keeping
-        # them sticky sends every request to the first replica while the other
-        # card idles. Only explicit conversation keys stay sticky.
-        _fallback_key = ":fallback:" in str(affinity_key)
-        try:
-            _idle_threshold = float(_resolve_affinity_spillover_config().get("idle_threshold_s", 60))
-        except Exception:
-            _idle_threshold = 60.0
-        # Fallback keys hash the conversation's first user message, so they are
-        # conversations too: splitting one across replicas throws away its KV
-        # cache (an 85k-token agent prompt re-prefilled for ~54 s) and the client
-        # times out. New conversations still spread; an owned one stays put
-        # until the idle-replica preload moves it.
+        # Affinity is per conversation, fallback keys included: splitting one
+        # across replicas throws away its KV cache (an 85k-token agent prompt
+        # re-prefilled for ~54 s) and the client times out. New conversations
+        # spread; an owned one stays put.
         owner_now = REPLICA_ROUTER_STATE.owner_of(affinity_key, now)
         if owner_now is not None and owner_now in members:
             # Concurrent burst: the conversation stays sticky while the owner has
@@ -7411,22 +7399,18 @@ def select_replica_for_request(
                     break
             if _spill is not None:
                 with REPLICA_ROUTER_STATE.lock:
-                    _NINFER_RECENT.setdefault(_spill, []).append(now_sel)
-                    _NINFER_LAST[_spill] = now_sel
+                    _STATIC_ROUTE_RECENT.setdefault(_spill, []).append(now_sel)
+                    _STATIC_ROUTE_LAST[_spill] = now_sel
                 log_api_event("replica_spill_concurrent", {
                     "model": base_model.model_id, "owner": owner_now, "spill": _spill,
                 })
                 return _spill, affinity_key, _spill in replica_ids
-            # The idle-replica preload ran on every owned turn and migrated the
-            # conversation to whichever route was idle >60 s. With a single long
-            # conversation that ping-pongs: 519 preloads today, each re-prefilling
-            # the full prompt on the other card, and the traffic alternated in
-            # blocks instead of using both GPUs. Affinity now stays put; new
-            # conversations distribute by round-robin and same-conversation
-            # overflow still spills to the other replica when the owner is full.
-            _NINFER_LAST[owner_now] = now_sel
+            # No migration between routes: the old per-turn preload ping-ponged
+            # one conversation between cards, re-prefilling the full prompt each
+            # time. Affinity stays put; only the burst overflow above leaves it.
+            _STATIC_ROUTE_LAST[owner_now] = now_sel
             with REPLICA_ROUTER_STATE.lock:
-                _NINFER_RECENT.setdefault(owner_now, []).append(now_sel)
+                _STATIC_ROUTE_RECENT.setdefault(owner_now, []).append(now_sel)
             try:
                 _orec = REPLICA_ROUTER_STATE.records.get(owner_now)
                 if _orec is not None:
@@ -7437,16 +7421,16 @@ def select_replica_for_request(
                 pass
             return owner_now, affinity_key, owner_now in replica_ids
         with REPLICA_ROUTER_STATE.lock:
-            _recent = _NINFER_RECENT
+            _recent = _STATIC_ROUTE_RECENT
             for _mid in members:
                 _recent[_mid] = [t for t in _recent.get(_mid, []) if now_sel - t <= 15.0]
             loads = [len(_recent.get(_mid, [])) for _mid in members]
-            start = int(_NINFER_RR.get(base_model.model_id, 0))
+            start = int(_STATIC_ROUTE_RR.get(base_model.model_id, 0))
             idx = min(
                 range(len(members)),
                 key=lambda i: (loads[i], (i - start) % len(members)),
             )
-            _NINFER_RR[base_model.model_id] = start + 1
+            _STATIC_ROUTE_RR[base_model.model_id] = start + 1
             _recent.setdefault(members[idx], []).append(now_sel)
         target = members[idx]
         REPLICA_ROUTER_STATE.bind(
@@ -17498,119 +17482,11 @@ def _is_loopback_client(host: str) -> bool:
         return False
 
 
-_NINFER_RR: dict[str, int] = {}
-_NINFER_RECENT: dict[str, list[float]] = {}
-_NINFER_LAST: dict[str, float] = {}
-_NINFER_PRELOADING: set[str] = set()
+_STATIC_ROUTE_RR: dict[str, int] = {}
+_STATIC_ROUTE_RECENT: dict[str, list[float]] = {}
+_STATIC_ROUTE_LAST: dict[str, float] = {}
 
 
-def _ninfer_schedule_idle_preload(
-    affinity_key: str,
-    owner: str,
-    members: list[str],
-    payload: dict,
-    config_path: Path | str | None,
-    threshold_s: float,
-    *,
-    capacity_of,
-) -> None:
-    """Warm an idle replica with this conversation and switch the sticky to it.
-
-    Runs in a background thread so the request that triggered it is served by
-    the owner. Once the prefill lands, the affinity is rebound to the warmed
-    replica: the next turn reuses its KV instead of paying the prefill again.
-    """
-    try:
-        import threading
-        import urllib.request
-
-        now = time.monotonic()
-        target = None
-        for mid in members:
-            if mid == owner:
-                continue
-            last = float(_NINFER_LAST.get(mid, 0.0) or 0.0)
-            idle_s = (now - last) if last > 0 else float("inf")
-            if idle_s < threshold_s:
-                continue
-            try:
-                free_slots = capacity_of(mid) - int(
-                    (REPLICA_ROUTER_STATE.records.get(mid).in_flight
-                     if mid in REPLICA_ROUTER_STATE.records else
-                     REPLICA_ROUTER_STATE.base_in_flight.get(mid, 0)) or 0
-                )
-            except Exception:
-                free_slots = 0
-            if free_slots <= 0:
-                continue
-            target = mid
-            break
-        if target is None:
-            return
-        key = f"{affinity_key}|{target}"
-        with REPLICA_ROUTER_STATE.lock:
-            if key in _NINFER_PRELOADING:
-                return
-            _NINFER_PRELOADING.add(key)
-        try:
-            port = get_config_model_port_map(
-                Path(config_path) if config_path is not None else Path(DEFAULT_CONFIG_PATH)
-            ).get(target)
-        except Exception:
-            port = None
-        if not port:
-            with REPLICA_ROUTER_STATE.lock:
-                _NINFER_PRELOADING.discard(key)
-            return
-        body = {
-            "model": "qwen3.8-27b",
-            "messages": payload.get("messages") or [],
-            "max_tokens": 1,
-            "temperature": 0.0,
-            "stream": False,
-        }
-        if payload.get("tools"):
-            body["tools"] = payload.get("tools")
-
-        def _run() -> None:
-            ok = False
-            try:
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{int(port)}/v1/chat/completions",
-                    data=json.dumps(body).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=900) as resp:
-                    ok = resp.status == 200
-            except Exception:
-                ok = False
-            finally:
-                with REPLICA_ROUTER_STATE.lock:
-                    _NINFER_PRELOADING.discard(key)
-            if ok:
-                try:
-                    REPLICA_ROUTER_STATE.bind(
-                        affinity_key,
-                        target,
-                        _TransferReason.STICKY_REFRESH,
-                        ttl_s=float(_resolve_affinity_spillover_config().get("sticky_ttl_s", 3600) or 3600),
-                        now=time.monotonic(),
-                    )
-                    log_api_event("replica_preload_switch", {
-                        "key_hash": hashlib.sha256(str(affinity_key).encode()).hexdigest()[:12],
-                        "from": owner, "to": target, "idle_threshold_s": threshold_s,
-                    })
-                except Exception:
-                    pass
-
-        threading.Thread(target=_run, daemon=True, name="ninfer-preload").start()
-        log_api_event("replica_preload_start", {"from": owner, "to": target, "threshold_s": threshold_s})
-    except Exception:
-        pass
-
-
-_NINFER_LAST: dict[str, float] = {}
 
 MAINTENANCE_FLAG_PATH = DEFAULT_REQUESTS_LOG_PATH.with_name("maintenance")
 MAINTENANCE_TARGET_PATH = MAINTENANCE_FLAG_PATH.with_name("maintenance-target")
