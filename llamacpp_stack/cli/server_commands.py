@@ -564,7 +564,17 @@ def resolve_request_reasoning_budget(payload: dict[str, object], model, *, serve
         return 0, "model_probe"
     if gen_lim is None:
         return half, "half_context"
-    reserve = min(DEFAULT_REASONING_VISIBLE_RESERVE, max(1, gen_lim // 8))
+    if backend == "ninfer":
+        # The closing marker and the budget notice count against the same
+        # output limit, so the generic 1/8 reserve can be gone before any
+        # visible token (measured: budget 1313 of max_tokens 1500 -> 0 chars of
+        # content). Reserve room for the answer, and disable thinking outright
+        # when the request is too small to hold both.
+        if gen_lim <= 1024:
+            return 0, "ninfer_small_output_disable_thinking"
+        reserve = max(512, min(2048, gen_lim // 4))
+    else:
+        reserve = min(DEFAULT_REASONING_VISIBLE_RESERVE, max(1, gen_lim // 8))
     budget = max(0, min(half, gen_lim - reserve))
     reason = "half_context_clamped_to_generation_limit" if budget < half else "half_context"
     return budget, reason
