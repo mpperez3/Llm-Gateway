@@ -19430,9 +19430,19 @@ def start_ctx_metadata_server(args):
                         server_defaults=_rb_defaults,
                     )
                     if reasoning_budget is not None:
-                        upstream_payload[_rb_field] = reasoning_budget
-                        if _rb_backend == "ninfer":
-                            upstream_payload["reasoning_control"] = True
+                        if _rb_backend == "ninfer" and reasoning_budget == 0:
+                            # A zero budget does not switch thinking off in the
+                            # engine; `enable_thinking: false` in the template
+                            # kwargs does (measured: 0 reasoning chars, visible
+                            # answer instead of an empty length-cut).
+                            _kwargs = upstream_payload.get("chat_template_kwargs")
+                            _kwargs = dict(_kwargs) if isinstance(_kwargs, dict) else {}
+                            _kwargs["enable_thinking"] = False
+                            upstream_payload["chat_template_kwargs"] = _kwargs
+                        else:
+                            upstream_payload[_rb_field] = reasoning_budget
+                            if _rb_backend == "ninfer":
+                                upstream_payload["reasoning_control"] = True
                         log_api_event(
                             "openai_reasoning_budget_applied",
                             {
