@@ -1321,6 +1321,14 @@ def route_capabilities(entry: object, model: object | None = None) -> dict[str, 
     instance and ``vision: true`` only on the one that actually carries it.
     Listing metadata only: llama-swap never routes on it.
     """
+    try:
+        if str(getattr(model, "backend", "")).strip().lower() == "ninfer":
+            overrides = getattr(model, "server_overrides", None) or {}
+            opts = overrides.get("ninfer") if isinstance(overrides, dict) else None
+            if (opts or {}).get("vision"):
+                return {"vision": True}
+    except Exception:
+        pass
     cmd = str((entry or {}).get("cmd") or "")
     if "--limit-mm-per-prompt" in cmd:
         # vLLM renders this flag when the catalog grants image/video input;

@@ -12682,15 +12682,22 @@ def _has_configured_mmproj_runtime(model: ManagedModel) -> bool:
 
 
 def _model_is_vllm_multimodal(model) -> bool:
-    """True for vLLM models: the vision tower ships inside the checkpoint.
+    """True for engines whose vision tower ships inside the model, not an mmproj.
 
-    vLLM needs no mmproj file, so the llama.cpp-style "no projector" gate must not
-    reject image requests for backend=vllm (see docs §25).
+    vLLM loads it from the checkpoint; NInfer carries the projector in its
+    artifact when the catalog enables it (server_overrides.ninfer.vision).
     """
     try:
-        return str(getattr(model, "backend", "") or "").strip().lower() == "vllm"
+        backend = str(getattr(model, "backend", "") or "").strip().lower()
+        if backend == "vllm":
+            return True
+        if backend == "ninfer":
+            overrides = getattr(model, "server_overrides", None) or {}
+            opts = overrides.get("ninfer") if isinstance(overrides, dict) else None
+            return bool((opts or {}).get("vision"))
     except Exception:
         return False
+    return False
 
 
 def _cmdline_mmproj_path(cmdline: str) -> str | None:
